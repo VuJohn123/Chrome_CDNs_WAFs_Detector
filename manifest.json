@@ -1,19 +1,34 @@
 {
   "manifest_version": 3,
-  "name": "Multi-CDN/WAF Detector",
-  "version": "8.1.0",
-  "description": "Detect 21 CDN/WAF/Bot-Management providers via domain or direct IP scan, with PTR/RDAP cross-verification, multi-IP (anycast) inspection, scan history, and hardened scoring against false-positive corroboration.",
+  "name": "__MSG_extName__",
+  "version": "9.1.0",
+  "description": "__MSG_extDescription__",
   "minimum_chrome_version": "109",
   "permissions": [
     "storage",
     "cookies",
-    "tabs"
+    "tabs",
+    "contextMenus",
+    "downloads",
+    "webRequest",
+    "webRequestBlocking",
+    "notifications",
+    "alarms",
+    "sidePanel",
+    "scripting"
   ],
   "host_permissions": [
     "<all_urls>"
   ],
+  "externally_connectable": {
+    "matches": []
+  },
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+  "default_locale": "en",
+  "side_panel": {
+    "default_path": "sidepanel.html"
   },
   "background": {
     "service_worker": "background.js",

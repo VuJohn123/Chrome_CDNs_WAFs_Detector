@@ -37,7 +37,10 @@ importScripts(
   'tencenteo.js',
   'alicdn.js',
   'arvancloud.js',
-  'vncdn.js'
+  'vncdn.js',
+  'flyio.js',
+  'render.js',
+  'railway.js'
 );
 
 // ── Constants ─────────────────────────────────────────────────
@@ -439,6 +442,247 @@ async function clearHistory() {
   try { await chrome.storage.local.remove(HISTORY_KEY); } catch {}
 }
 
+// ── A4: Diff against the most recent prior scan of the same domain ─
+// Must be called BEFORE addToHistory() overwrites the entry for `domain`.
+async function diffAgainstHistory(domain, result) {
+  try {
+    const list = await getHistory();
+    const prior = list.find(e => e.domain === domain);
+    if (!prior) return null; // first time we've ever scanned this domain
+    const nowDetected = Object.entries(result.providers || {})
+      .filter(([, v]) => v.verdict?.detected)
+      .map(([id]) => id);
+    const before = new Set(prior.detected || []);
+    const after  = new Set(nowDetected);
+    const added   = nowDetected.filter(id => !before.has(id));
+    const removed = (prior.detected || []).filter(id => !after.has(id));
+    if (!added.length && !removed.length) return { changed: false, priorTs: prior.ts };
+    return { changed: true, priorTs: prior.ts, added, removed };
+  } catch { return null; }
+}
+
+// ── C3: Pinned/bookmarked domains (manual, distinct from auto history) ─
+const PINS_KEY = 'pinned_domains';
+async function getPins() {
+  try { const { [PINS_KEY]: list = [] } = await chrome.storage.local.get(PINS_KEY); return list; }
+  catch { return []; }
+}
+async function togglePin(domain) {
+  try {
+    const list = await getPins();
+    const idx = list.indexOf(domain);
+    if (idx >= 0) list.splice(idx, 1); else list.unshift(domain);
+    await chrome.storage.local.set({ [PINS_KEY]: list.slice(0, 200) });
+    return list;
+  } catch { return []; }
+}
+
+// ── A4 (improvement): Watchlist — auto re-scan + notify on change ──
+// Distinct from pins: pinning is "quick access", watching adds a scheduled
+// background re-scan via chrome.alarms and a chrome.notifications alert
+// when the detected provider set changes between checks.
+const WATCHLIST_KEY = 'watchlist_domains';
+const WATCHLIST_ALARM = 'cdnwaf-watchlist-check';
+const WATCHLIST_DEFAULT_INTERVAL_MIN = 360; // 6h — gentle default, configurable in Settings
+
+async function getWatchlist() {
+  try { const { [WATCHLIST_KEY]: list = [] } = await chrome.storage.local.get(WATCHLIST_KEY); return list; }
+  catch { return []; }
+}
+async function toggleWatch(domain) {
+  try {
+    const list = await getWatchlist();
+    const idx = list.indexOf(domain);
+    if (idx >= 0) list.splice(idx, 1); else list.unshift(domain);
+    await chrome.storage.local.set({ [WATCHLIST_KEY]: list.slice(0, 100) });
+    return list;
+  } catch { return []; }
+}
+async function ensureWatchlistAlarm() {
+  const settings = await getSettings();
+  const minutes = Math.max(60, settings.watchlistIntervalMin || WATCHLIST_DEFAULT_INTERVAL_MIN);
+  try {
+    chrome.alarms.create(WATCHLIST_ALARM, { periodInMinutes: minutes });
+  } catch {}
+}
+async function runWatchlistCheck() {
+  const domains = await getWatchlist();
+  for (const domain of domains) {
+    try {
+      const result = await performScan(domain, () => {});
+      const diff = await diffAgainstHistory(domain, result);
+      await setCached(domain, result);
+      await addToHistory(domain, result);
+      if (diff?.changed) {
+        const addedNames = (diff.added || []).join(', ');
+        const removedNames = (diff.removed || []).join(', ');
+        const bits = [addedNames && `+${addedNames}`, removedNames && `−${removedNames}`].filter(Boolean).join(' · ');
+        try {
+          chrome.notifications.create(`watch-${domain}-${Date.now()}`, {
+            type: 'basic',
+            iconUrl: 'icons/icon48.png',
+            title: `CDN/WAF changed: ${domain}`,
+            message: bits || 'Detected provider set changed.',
+          });
+        } catch {}
+      }
+    } catch { /* one failed domain shouldn't stop the rest of the watchlist */ }
+  }
+}
+
+// ── A3: Confidence decay — best-effort "last reviewed" map per provider,
+// derived from in-source dated comments at the time this build was authored.
+// This is NOT automatic; bump an entry's value when you next verify/update
+// that provider file so the staleness warning stays meaningful.
+const PROVIDER_LAST_REVIEWED = {
+  cloudflare: '2026-01', google: '2026-01', akamai: '2026-01', fastly: '2026-01',
+  imperva: '2026-01', cloudfront: '2026-01', azure: '2026-01', sucuri: '2026-01',
+  vercel: '2026-01', netlify: '2026-01', bunnycdn: '2026-01', stackpath: '2026-01',
+  keycdn: '2026-01', gcore: '2026-01', tencenteo: '2025-06', alicdn: '2025-06',
+  // No dated "2026 updates" comment block found in source for these three —
+  // treated as last touched earlier, so they decay sooner.
+  datadome: '2025-06', perimeterx: '2025-06', f5xc: '2025-06',
+  arvancloud: '2025-06',
+  // Explicitly marked in-source as an unverified/heuristic header spec —
+  // always shown as lower-confidence regardless of decay.
+  vncdn: '2025-01',
+};
+const STALE_AFTER_MONTHS = 6;
+function monthsSince(yyyyMm) {
+  const [y, m] = yyyyMm.split('-').map(Number);
+  const now = new Date();
+  return (now.getFullYear() - y) * 12 + (now.getMonth() + 1 - m);
+}
+function decayInfoFor(pid) {
+  const reviewed = PROVIDER_LAST_REVIEWED[pid];
+  if (!reviewed) return { lastReviewed: null, stale: false, monthsAgo: null };
+  const months = monthsSince(reviewed);
+  return { lastReviewed: reviewed, stale: months >= STALE_AFTER_MONTHS, monthsAgo: months };
+}
+
+// ── A1: Multi-layer chain ordering ─────────────────────────────
+// We only have evidence visible at the client edge — the `Via` header is
+// the one standardized field that's supposed to list every proxy hop in
+// order (RFC 9110 §7.6.3, outermost-last as written by each hop, but in
+// practice CDNs prepend/append inconsistently so we treat order as a
+// *signal*, not gospel) — combined with which providers actually got
+// detected, so we never invent a hop with no other corroborating evidence.
+function inferLayerChain(viaHeaderRaw, detectedProviderIds, providerNameOf) {
+  if (!detectedProviderIds.length) return null;
+  const via = (viaHeaderRaw || '').toLowerCase();
+  if (detectedProviderIds.length === 1) {
+    return { chain: [detectedProviderIds[0]], basis: 'single-provider', confidence: 'n/a' };
+  }
+  if (!via) {
+    // Multiple providers detected but no Via header to sequence them —
+    // we genuinely don't know the order. Say so instead of guessing.
+    return { chain: null, basis: 'no-via-header', confidence: 'unknown' };
+  }
+  // Via can list multiple hops comma-separated, e.g. "1.1 varnish, 1.1 google".
+  // Match each detected provider's known via-token against position in the string.
+  const VIA_TOKENS = {
+    cloudflare: ['cloudflare'], google: ['google'], akamai: ['akamai'],
+    fastly: ['varnish', 'fastly'], cloudfront: ['cloudfront'], azure: ['azure'],
+    vercel: ['vercel'], netlify: ['netlify'], bunnycdn: ['bunnycdn', 'bunny'],
+    stackpath: ['ecacc', 'ecs', 'edgecast'], keycdn: ['keycdn'], gcore: ['gcore'],
+    sucuri: ['sucuri'], tencenteo: ['tencent'], alicdn: ['alicdn', 'alibaba'],
+    arvancloud: ['arvan'], vncdn: ['vncdn', 'vnetwork'],
+  };
+  const positions = [];
+  for (const pid of detectedProviderIds) {
+    const tokens = VIA_TOKENS[pid] || [];
+    let pos = -1;
+    for (const t of tokens) { const i = via.indexOf(t); if (i >= 0 && (pos === -1 || i < pos)) pos = i; }
+    if (pos >= 0) positions.push({ pid, pos });
+  }
+  if (positions.length < 2) {
+    // Via header exists but didn't mention enough of the detected providers
+    // by name (common — many CDNs strip themselves from Via on egress).
+    return { chain: null, basis: 'via-incomplete', confidence: 'low', viaHeaderRaw };
+  }
+  positions.sort((a, b) => a.pos - b.pos);
+  // Via order as written is client-facing-first → origin-last per RFC intent,
+  // so the chain reads left-to-right as "closest to visitor" → "closest to origin".
+  const chain = positions.map(p => p.pid);
+  // Note any detected provider that never appeared in Via at all — likely a
+  // layer the client edge can't see directly (e.g. a WAF in front of origin
+  // that doesn't append itself), surfaced as "position unconfirmed" rather
+  // than silently dropped.
+  const unconfirmed = detectedProviderIds.filter(pid => !chain.includes(pid));
+  return { chain, unconfirmed, basis: 'via-header-order', confidence: 'medium', viaHeaderRaw };
+}
+
+// ── C2: Confidence breakdown — approximate, marginal-contribution method.
+// We don't modify each provider's score() internals (21 files, high risk of
+// drift); instead we toggle each currently-true boolean signal off one at a
+// time and re-run score() to see how many points it was worth. This is an
+// approximation — if a provider's scoring has caps/clamps or interaction
+// effects between signals, the parts won't always sum exactly to the total.
+// We label it as such in the UI rather than claim it's exact.
+function computeBreakdown(provider, signals, baseScore) {
+  const parts = [];
+  for (const key of Object.keys(signals)) {
+    if (signals[key] !== true) continue; // only booleans that fired contribute
+    const probe = { ...signals, [key]: false };
+    let altScore = 0;
+    try { altScore = provider.score(probe).score || 0; } catch { altScore = baseScore; }
+    const delta = baseScore - altScore;
+    if (delta > 0) parts.push({ signal: key, points: delta });
+  }
+  parts.sort((a, b) => b.points - a.points);
+  return parts;
+}
+
+// ── A2: Origin-IP-leak check (on-demand, not run on every default scan) ─
+// Uses crt.sh (public Certificate Transparency log search, no API key) to
+// enumerate subdomains/SANs the domain has ever issued certs for, then
+// probes a short list of commonly-unprotected subdomains to see whether
+// any of them resolve OUTSIDE the IP ranges of the CDN/WAF providers
+// already detected for the apex domain. We deliberately do NOT attempt to
+// read raw TLS certificate fields via fetch() — the browser/extension API
+// surface has no access to the peer certificate, so crt.sh is the only
+// honest no-cost source here.
+const COMMON_LEAK_SUBDOMAINS = [
+  'direct', 'origin', 'origin-www', 'old', 'dev', 'staging', 'ftp', 'mail',
+  'cpanel', 'webdisk', 'autodiscover', 'server', 'host', 'backend', 'api-origin',
+];
+async function crtShSubdomains(domain) {
+  try {
+    const res = await fetchT(
+      `https://crt.sh/?q=${encodeURIComponent('%.' + domain)}&output=json`,
+      {}, 12000
+    );
+    if (!res.ok) return [];
+    const json = await res.json().catch(() => []);
+    const names = new Set();
+    for (const row of (Array.isArray(json) ? json : [])) {
+      for (const n of String(row.name_value || '').split('\n')) {
+        const clean = n.trim().toLowerCase().replace(/^\*\./, '');
+        if (clean.endsWith(`.${domain}`) || clean === domain) names.add(clean);
+      }
+    }
+    return [...names];
+  } catch { return []; }
+}
+async function checkOriginLeak(domain, knownProviderRanges) {
+  const candidates = new Set(COMMON_LEAK_SUBDOMAINS.map(s => `${s}.${domain}`));
+  const ctNames = await crtShSubdomains(domain);
+  for (const n of ctNames.slice(0, 150)) candidates.add(n);
+
+  const findings = [];
+  await runPooled([...candidates], PROBE_CONCURRENCY, async sub => {
+    try {
+      const d = await doh(sub, 'A');
+      const ips = (d?.Answer || []).filter(r => r.type === 1).map(r => r.data.trim());
+      for (const ip of ips) {
+        const behindKnownCdn = knownProviderRanges.some(({ v4, v6 }) => ipMatches(ip, v4, v6));
+        if (!behindKnownCdn) findings.push({ host: sub, ip });
+      }
+    } catch {}
+  });
+  return { checkedCount: candidates.size, ctSourceCount: ctNames.length, findings };
+}
+
 // ── Shared common-header extraction ──────────────────────────
 // Called once per HTTP response; result is merged into every provider's signals.
 function extractCommonSignals(res) {
@@ -565,6 +809,9 @@ async function performScan(domain, progress) {
         allSig[p.id].dnsShortTtl     = shortTtl;
         allSig[p.id].dnsVeryShortTtl = veryShortTtl;
       }
+      // Store nsRecords on the first provider's bag so Phase 5 can read them
+      // for DNS-provider identification without a second lookup.
+      if (providers[0]) allSig[providers[0].id].nsRecords = nsRecords;
     }),
 
     // Cookie scan
@@ -684,27 +931,361 @@ async function performScan(domain, progress) {
   progress({ pct: 92, activity: `Scoring ${providers.length} providers…` });
 
   const results = {};
+  // Build a lightweight raw-header snapshot for custom-provider scoring
+  // (we keep it as a plain {header: value} object rather than a Headers instance
+  // so it survives serialisation into result objects if needed).
+  const headerSnapshot = {};
+  for (const id of Object.keys(allSig)) {
+    const s = allSig[id];
+    if (typeof s === 'object') {
+      for (const [k, v] of Object.entries(s)) {
+        if (typeof v === 'string' && v) headerSnapshot[k.toLowerCase()] = v;
+      }
+    }
+  }
+  // Raw header values are stored under specific known keys; the below covers
+  // the most common ones extracted in extractCommonSignals.
+  const rawHdrKeys = ['viaHeader','xCacheHeader','serverHeader','cfRay','xAmzCfId','xVercelId','xNfRequestId'];
+  for (const p of providers) {
+    const s = allSig[p.id];
+    for (const k of rawHdrKeys) if (s?.[k] && typeof s[k] === 'string') headerSnapshot[k] = s[k];
+  }
+
   for (const p of providers) {
     let verdict;
     try   { verdict = p.score(allSig[p.id]); }
     catch { verdict = { score: 0, label: 'Unlikely', detected: false }; }
-    results[p.id] = { signals: allSig[p.id], verdict };
+    const breakdown = verdict.score > 0 ? computeBreakdown(p, allSig[p.id], verdict.score) : [];
+    results[p.id] = { signals: allSig[p.id], verdict, breakdown, decay: decayInfoFor(p.id) };
   }
+
+  // ── Custom provider scoring (declarative rules, no eval) ──────
+  const customDefs = await getCustomProviders();
+  const customResults = {};
+  for (const def of customDefs) {
+    const cname = Object.values(allSig).find(s => s?.cname)?.cname || null;
+    const verdict = scoreCustomProvider(def, cname, headerSnapshot);
+    customResults[def.id] = { def, verdict };
+  }
+
+  // ── B6: DNS-provider fingerprint — shown in results but NOT mixed into
+  // CDN/WAF scoring because they're independent infrastructure layers.
+  const dnsProvider = identifyDnsProvider(
+    // nsRecords are collected in doHLookup() and flow through via the first
+    // provider's signal bag (all providers share the same nsRecords).
+    allSig[providers[0]?.id]?.nsRecords || []
+  );
+
+  // ── B2: Firefox TLS intel (if ambient listener captured it) ───
+  const tlsIntel = tlsIntelByRequestId.get(`https://${domain}/`) || null;
+
+  // ── Migration-conflict detection (improvement #15) ─────────
+  // Fires when two or more non-overlapping providers are both detected at
+  // medium-to-high confidence AND share no known joint-deployment pattern.
+  // The simple version: look for (non-WAF-over-CDN) pairs, e.g. two CDNs.
+  const detectedIds = Object.entries(results)
+    .filter(([, v]) => v.verdict?.detected)
+    .map(([id]) => id);
+  const WAF_IDS = new Set(['imperva', 'sucuri', 'datadome', 'perimeterx', 'f5xc']);
+  const cdn_detected = detectedIds.filter(id => !WAF_IDS.has(id));
+  let migrationWarning = null;
+  if (cdn_detected.length >= 2) {
+    migrationWarning = {
+      candidates: cdn_detected,
+      note: 'Two or more CDN/edge providers detected simultaneously. This may indicate an in-progress infrastructure migration, a misconfigured CNAME chain, or a deliberate multi-CDN setup — worth verifying.'
+    };
+  }
+
+  // ── A1: layer-order inference, using the now-known detected set ───
+  const layerChain = inferLayerChain(allSig[providers[0]?.id]?.viaHeader, detectedIds, id => id);
 
   return {
     providers: results,
+    customProviders: customResults,
     resolvedIPs,
     ipEvidence,
     isDirectIP,
+    layerChain,
+    dnsProvider,
+    tlsIntel,
+    migrationWarning,
     scannedAt: new Date().toISOString()
   };
 }
 
-// ── Startup ───────────────────────────────────────────────────
-// Scans must not start scoring IP-range signals until cached ranges (or a
-// fresh fetch) have loaded, otherwise ipSignal matches are silently skipped
-// for the first scan after the service worker/background script wakes up.
-const rangesReady = loadCachedRanges().catch(() => {});
+// ── B6: Badge — shows detected-provider count on the toolbar icon ──
+async function updateBadge(result) {
+  try {
+    const count = Object.values(result?.providers || {}).filter(v => v.verdict?.detected).length;
+    await chrome.action.setBadgeText({ text: count > 0 ? String(count) : '' });
+    await chrome.action.setBadgeBackgroundColor({ color: count > 0 ? '#2ecc71' : '#4a5a70' });
+  } catch {}
+}
+
+// ── D4: Threat-intel — recent CVEs mentioning a provider, via NVD's public
+// CVE API (no key required at low volume; cached 24h locally to stay well
+// under NVD's public rate limit and avoid hammering it on every popup open).
+const CVE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+async function fetchProviderCves(providerName) {
+  const cacheKey = `cve_${providerName.toLowerCase().replace(/\s+/g, '_')}`;
+  try {
+    const { [cacheKey]: cached } = await chrome.storage.local.get(cacheKey);
+    if (cached && Date.now() - cached.ts < CVE_CACHE_TTL_MS) return cached.data;
+  } catch {}
+  try {
+    const url = `https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${encodeURIComponent(providerName)}&resultsPerPage=8`;
+    const res = await fetchT(url, {}, 10000);
+    if (!res.ok) return { error: `NVD returned ${res.status}`, items: [] };
+    const json = await res.json();
+    const items = (json.vulnerabilities || []).map(v => ({
+      id: v.cve?.id,
+      published: v.cve?.published,
+      summary: (v.cve?.descriptions || []).find(d => d.lang === 'en')?.value?.slice(0, 220) || ''
+    }));
+    const data = { items, fetchedAt: Date.now() };
+    await chrome.storage.local.set({ [cacheKey]: { ts: Date.now(), data } });
+    return data;
+  } catch (e) { return { error: e.message || 'lookup failed', items: [] }; }
+}
+
+// ── D2: Crowd-sourced signature reporting — OPT-IN ONLY, disabled unless
+// the person both flips the toggle AND supplies their own deployed
+// endpoint (see /worker/README.md). We never send domain, IP, or any
+// per-scan identifying data — only "this provider emitted a header we
+// don't recognize", which is the minimum needed to spot new signatures.
+const SETTINGS_KEY = 'app_settings';
+const DEFAULT_SETTINGS = {
+  theme: 'system', crowdReportEnabled: false, crowdReportEndpoint: '',
+  watchlistIntervalMin: 360, ambientModeEnabled: false
+};
+async function getSettings() {
+  try {
+    const { [SETTINGS_KEY]: s } = await chrome.storage.local.get(SETTINGS_KEY);
+    return { ...DEFAULT_SETTINGS, ...(s || {}) };
+  } catch { return DEFAULT_SETTINGS; }
+}
+async function setSettings(patch) {
+  const next = { ...(await getSettings()), ...patch };
+  try { await chrome.storage.local.set({ [SETTINGS_KEY]: next }); } catch {}
+  return next;
+}
+async function maybeSubmitCrowdReport(providerId, unknownHeaderNames) {
+  if (!unknownHeaderNames.length) return;
+  const settings = await getSettings();
+  if (!settings.crowdReportEnabled || !settings.crowdReportEndpoint) return;
+  try {
+    await fetchT(settings.crowdReportEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ providerId, unknownHeaderNames, engineVersion: ENGINE_VERSION })
+    }, 5000);
+  } catch { /* best-effort, never block or surface errors to the user */ }
+}
+
+
+// ── B9: Custom provider packs (local import, MV3-safe) ─────────
+// MV3 forbids executing remotely-fetched code, so this is NOT a plugin
+// system that runs arbitrary JS — it's a small declarative JSON schema
+// (CNAME regex strings + simple header-presence checks + point values)
+// that this same trusted, already-bundled code interprets. No eval(), no
+// new Function(), no remote script loading. This is the realistic core of
+// "let people add providers without an extension update" within MV3's
+// rules — a discovery/sharing hub on top of it is a separate, bigger
+// project (not built here; the crowd-report Worker could grow into one).
+const CUSTOM_PROVIDERS_KEY = 'custom_providers';
+function validateCustomProviderSchema(p) {
+  if (!p || typeof p !== 'object') throw new Error('Not an object');
+  if (!/^custom_[a-z0-9_]{1,30}$/.test(p.id || '')) throw new Error('id must match custom_[a-z0-9_]{1,30}');
+  if (!p.name || typeof p.name !== 'string') throw new Error('Missing name');
+  const cname = Array.isArray(p.cnamePatterns) ? p.cnamePatterns : [];
+  const headers = Array.isArray(p.headerChecks) ? p.headerChecks : [];
+  if (!cname.length && !headers.length) throw new Error('Need at least one cnamePattern or headerCheck');
+  for (const c of cname) { if (typeof c.pattern !== 'string' || typeof c.points !== 'number') throw new Error('Bad cnamePattern entry'); new RegExp(c.pattern); }
+  for (const h of headers) { if (typeof h.header !== 'string' || typeof h.points !== 'number') throw new Error('Bad headerCheck entry'); if (h.valuePattern) new RegExp(h.valuePattern); }
+  return { id: p.id, name: String(p.name).slice(0, 60), color: /^#[0-9a-f]{6}$/i.test(p.color || '') ? p.color : '#94a3b8', cnamePatterns: cname.slice(0, 10), headerChecks: headers.slice(0, 15) };
+}
+async function getCustomProviders() {
+  try { const { [CUSTOM_PROVIDERS_KEY]: list = [] } = await chrome.storage.local.get(CUSTOM_PROVIDERS_KEY); return list; }
+  catch { return []; }
+}
+async function importCustomProvider(json) {
+  try {
+    const parsed = typeof json === 'string' ? JSON.parse(json) : json;
+    const clean = validateCustomProviderSchema(parsed);
+    const list = (await getCustomProviders()).filter(p => p.id !== clean.id);
+    list.push(clean);
+    await chrome.storage.local.set({ [CUSTOM_PROVIDERS_KEY]: list.slice(0, 25) });
+    return { ok: true, provider: clean };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+async function removeCustomProvider(id) {
+  const list = (await getCustomProviders()).filter(p => p.id !== id);
+  await chrome.storage.local.set({ [CUSTOM_PROVIDERS_KEY]: list });
+  return list;
+}
+// Scores a custom provider against the SAME signal bag already gathered for
+// the run (cname match flags + raw header access via a small res-shaped
+// passthrough is not available post-hoc, so custom providers score off the
+// CNAME the run already resolved plus a recorded raw-header snapshot taken
+// during Phase 2 — see capturedHeadersForCustom in performScan).
+function scoreCustomProvider(def, cname, headerSnapshot) {
+  let n = 0;
+  const hits = [];
+  for (const c of def.cnamePatterns) {
+    try { if (cname && new RegExp(c.pattern, 'i').test(cname)) { n += c.points; hits.push(`cname:${c.pattern}`); } } catch {}
+  }
+  for (const h of def.headerChecks) {
+    const val = headerSnapshot?.[h.header.toLowerCase()];
+    if (val === undefined) continue;
+    try {
+      if (!h.valuePattern || new RegExp(h.valuePattern, 'i').test(val)) { n += h.points; hits.push(`header:${h.header}`); }
+    } catch {}
+  }
+  n = Math.min(n, 100);
+  return { score: n, label: n >= 50 ? `Possible ${def.name}` : n >= 20 ? `Weak ${def.name} indicators` : 'Unlikely', detected: n >= 20, hits };
+}
+
+// ── B5: Share / import a scan as a compact code (not a universal link) ──
+// chrome-extension://<id>/... URLs only work for someone who already has
+// THIS install of the extension (extension IDs differ per machine unless
+// published with a fixed key), so this is a copy/paste code, not a magic
+// clickable link that works for anyone.
+async function makeShareCode(result) {
+  try {
+    const json = JSON.stringify(result);
+    if (typeof CompressionStream === 'function') {
+      const stream = new Blob([json]).stream().pipeThrough(new CompressionStream('gzip'));
+      const buf = await new Response(stream).arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let bin = ''; for (const b of bytes) bin += String.fromCharCode(b);
+      return 'gz1:' + btoa(bin);
+    }
+    return 'raw1:' + btoa(unescape(encodeURIComponent(json)));
+  } catch (e) { return null; }
+}
+async function decodeShareCode(code) {
+  if (!code || typeof code !== 'string') throw new Error('Empty code');
+  const [tag, payload] = code.split(':');
+  if (!payload) throw new Error('Malformed code');
+  const bin = atob(payload);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  if (tag === 'gz1') {
+    if (typeof DecompressionStream !== 'function') throw new Error('This browser cannot decompress gz1 codes');
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+    const text = await new Response(stream).text();
+    return JSON.parse(text);
+  }
+  if (tag === 'raw1') return JSON.parse(decodeURIComponent(escape(bin)));
+  throw new Error('Unknown code format');
+}
+
+// ── B6: DNS-provider fingerprint — separate from CDN/WAF detection.
+// Looks at NS records to identify the authoritative DNS provider, which is
+// frequently a different company than whatever fronts the HTTP traffic.
+const DNS_PROVIDER_PATTERNS = [
+  { re: /\.ns\.cloudflare\.com$/,        name: 'Cloudflare DNS' },
+  { re: /awsdns-.*\.(org|com|net|co\.uk)$/, name: 'Amazon Route 53' },
+  { re: /\.domaincontrol\.com$/,         name: 'GoDaddy DNS' },
+  { re: /\.azure-dns\.(com|net|org|info)$/, name: 'Azure DNS' },
+  { re: /\.googledomains\.com$/,         name: 'Google Domains DNS' },
+  { re: /\.ns\.cloud\.google\.com$/,     name: 'Google Cloud DNS' },
+  { re: /\.dnsmadeeasy\.com$/,           name: 'DNS Made Easy' },
+  { re: /\.nsone\.net$/,                 name: 'NS1' },
+  { re: /\.dynect\.net$/,                name: 'Oracle Dyn' },
+  { re: /\.digitalocean\.com$/,          name: 'DigitalOcean DNS' },
+  { re: /\.namecheaphosting\.com$/,      name: 'Namecheap DNS' },
+  { re: /\.vnpt\.vn$/i,                  name: 'VNPT DNS' },
+  { re: /\.matbao\.net$/i,               name: 'Mat Bao DNS' },
+  { re: /\.pavietnam\.vn$/i,             name: 'P.A Vietnam DNS' },
+  { re: /\.inet\.vn$/i,                  name: 'Vietnix DNS' },
+];
+function identifyDnsProvider(nsRecords) {
+  for (const ns of (nsRecords || [])) {
+    for (const { re, name } of DNS_PROVIDER_PATTERNS) if (re.test(ns)) return name;
+  }
+  return null;
+}
+
+// ── B2: Firefox-only real TLS/cert intel via webRequest.getSecurityInfo().
+// EXPERIMENTAL — feature-detected because this API does not exist on
+// Chrome (no equivalent has shipped there as of this build; there is a
+// 2025 W3C proposal, github.com/w3c/webextensions#882, to add one). On
+// Chrome this whole block is simply inert. Requires "blocking" on
+// onHeadersReceived, which itself requires the "webRequestBlocking"
+// permission — declared in manifest.json but only meaningful on Firefox.
+const tlsIntelByRequestId = new Map();
+try {
+  if (typeof browser !== 'undefined' && browser.webRequest && browser.webRequest.getSecurityInfo) {
+    browser.webRequest.onHeadersReceived.addListener(
+      async details => {
+        try {
+          const info = await browser.webRequest.getSecurityInfo(details.requestId, { certificateChain: true });
+          if (info.state === 'secure' || info.state === 'weak') {
+            tlsIntelByRequestId.set(details.url, {
+              protocol: info.protocolVersion, cipher: info.cipherSuite,
+              certSubject: info.certificates?.[0]?.subject || null,
+              certIssuer: info.certificates?.[0]?.issuer || null,
+              certSha256: info.certificates?.[0]?.fingerprint?.sha256 || null,
+              ech: !!info.usedEch, weaknessReasons: info.weaknessReasons || [],
+            });
+          }
+        } catch {}
+        return {};
+      },
+      { urls: ['<all_urls>'] },
+      ['blocking']
+    );
+  }
+} catch { /* not Firefox, or permission unavailable — silently inert */ }
+
+// ── B1: Passive ambient detection — OFF by default, opt-in in Settings.
+// Read-only header observation (NOT "blocking" — no webRequestBlocking
+// needed for this listener) across every request the browser makes, used
+// to build a lightweight per-tab badge of detected providers without the
+// person ever clicking "Scan". Results are heuristic-only (no DNS/cookie/
+// probe corroboration like a real scan has) and are intentionally not
+// merged into scan history — they're a hint, not a verdict.
+const ambientByTab = new Map(); // tabId -> Set(providerName)
+async function ambientHeadersListener(details) {
+  try {
+    const settings = await getSettings();
+    if (!settings.ambientModeEnabled) return;
+    if (details.tabId < 0) return;
+    const hint = ambientGuessFromHeaders(details.responseHeaders || []);
+    if (!hint) return;
+    const set = ambientByTab.get(details.tabId) || new Set();
+    set.add(hint);
+    ambientByTab.set(details.tabId, set);
+    chrome.action.setBadgeText({ tabId: details.tabId, text: String(set.size) });
+    chrome.action.setBadgeBackgroundColor({ tabId: details.tabId, color: '#1ed4ff' });
+  } catch {}
+}
+function ambientGuessFromHeaders(headerList) {
+  const h = name => (headerList.find(x => x.name.toLowerCase() === name)?.value || '');
+  if (h('cf-ray') || /cloudflare/i.test(h('server'))) return 'Cloudflare';
+  if (/^akamaighost/i.test(h('server'))) return 'Akamai';
+  if (h('x-amz-cf-id')) return 'CloudFront';
+  if (h('x-served-by') || /^varnish/i.test(h('server'))) return 'Fastly';
+  if (h('x-iinfo')) return 'Imperva';
+  if (h('x-azure-ref')) return 'Azure Front Door';
+  if (h('x-vercel-id')) return 'Vercel';
+  if (h('x-nf-request-id')) return 'Netlify';
+  return null;
+}
+try {
+  chrome.webRequest.onHeadersReceived.addListener(
+    ambientHeadersListener,
+    { urls: ['<all_urls>'], types: ['main_frame'] },
+    ['responseHeaders']
+  );
+  chrome.tabs.onRemoved.addListener(tabId => ambientByTab.delete(tabId));
+  chrome.tabs.onUpdated.addListener((tabId, info) => {
+    if (info.status === 'loading') { ambientByTab.delete(tabId); chrome.action.setBadgeText({ tabId, text: '' }); }
+  });
+} catch { /* webRequest unavailable — ambient mode simply won't activate */ }
+
+
 
 // ── Port listener (progress streaming) ───────────────────────
 chrome.runtime.onConnect.addListener(port => {
@@ -727,9 +1308,15 @@ chrome.runtime.onConnect.addListener(port => {
     const emit = update => { if (!dead) port.postMessage({ type: 'progress', ...update }); };
     try {
       const result = await performScan(domain, emit);
+      const diff = await diffAgainstHistory(domain, result); // before history is overwritten
       await setCached(domain, result);
       await addToHistory(domain, result);
-      if (!dead) port.postMessage({ type: 'result', data: result, cached: false });
+      await updateBadge(result);
+      // Record for multi-tab correlation
+      const tabId = port.sender?.tab?.id;
+      if (tabId != null) recordTabResult(tabId, domain, result);
+      const tabCorrelation = getTabCorrelation(domain);
+      if (!dead) port.postMessage({ type: 'result', data: { ...result, tabCorrelation }, cached: false, diff });
     } catch (err) {
       if (!dead) port.postMessage({ type: 'error', message: err.message || 'Unknown error' });
     }
@@ -739,8 +1326,15 @@ chrome.runtime.onConnect.addListener(port => {
 // ── Legacy one-shot (fallback) ────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
   if (msg.action === 'scan') {
-    performScan(msg.domain, () => {})
-      .then(async r => { await setCached(msg.domain, r); await addToHistory(msg.domain, r); return r; })
+    (async () => {
+      const r = await performScan(msg.domain, () => {});
+      const diff = await diffAgainstHistory(msg.domain, r);
+      await setCached(msg.domain, r);
+      await addToHistory(msg.domain, r);
+      await updateBadge(r);
+      const tabCorrelation = getTabCorrelation(msg.domain);
+      return { ...r, tabCorrelation, diff };
+    })()
       .then(r  => sendResponse(r))
       .catch(e => sendResponse({ error: e.message }));
     return true;
@@ -753,4 +1347,267 @@ chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
     clearHistory().then(() => sendResponse({ ok: true }));
     return true;
   }
+  if (msg.action === 'getPins') {
+    getPins().then(list => sendResponse({ pins: list }));
+    return true;
+  }
+  if (msg.action === 'togglePin') {
+    togglePin(msg.domain).then(list => sendResponse({ pins: list }));
+    return true;
+  }
+  if (msg.action === 'getCves') {
+    fetchProviderCves(msg.providerName).then(data => sendResponse(data));
+    return true;
+  }
+  if (msg.action === 'checkOriginLeak') {
+    (async () => {
+      const providers = self.CDN_PROVIDERS || [];
+      const ranges = providers.filter(p => p.ipConfig?.v4 || p.ipConfig?.v6)
+        .map(p => ({ v4: p.ipConfig.v4, v6: p.ipConfig.v6 }));
+      // Use favicon-enhanced version so false-positives get flagged
+      return checkOriginLeakWithFavicon(msg.domain, ranges);
+    })().then(r => sendResponse(r)).catch(e => sendResponse({ error: e.message, findings: [] }));
+    return true;
+  }
+  if (msg.action === 'getSettings') {
+    getSettings().then(s => sendResponse(s));
+    return true;
+  }
+  if (msg.action === 'setSettings') {
+    setSettings(msg.patch || {}).then(s => sendResponse(s));
+    return true;
+  }
+  if (msg.action === 'submitCrowdReport') {
+    maybeSubmitCrowdReport(msg.providerId, msg.notes ? [msg.notes] : [])
+      .then(() => sendResponse({ ok: true }));
+    return true;
+  }
+  if (msg.action === 'getTabCorrelation') {
+    sendResponse(getTabCorrelation(msg.domain));
+    return true;
+  }
+  if (msg.action === 'getAmbientResults') {
+    const tabId = msg.tabId;
+    sendResponse({ providers: tabId != null ? [...(ambientByTab.get(tabId) || [])] : [] });
+    return true;
+  }
+  if (msg.action === 'getWatchlist') {
+    getWatchlist().then(list => sendResponse({ watchlist: list }));
+    return true;
+  }
+  if (msg.action === 'toggleWatch') {
+    toggleWatch(msg.domain).then(async list => {
+      await ensureWatchlistAlarm();
+      sendResponse({ watchlist: list });
+    });
+    return true;
+  }
+  if (msg.action === 'runWatchlistNow') {
+    runWatchlistCheck().then(() => sendResponse({ ok: true }));
+    return true;
+  }
+  if (msg.action === 'getCustomProviders') {
+    getCustomProviders().then(list => sendResponse({ providers: list }));
+    return true;
+  }
+  if (msg.action === 'importCustomProvider') {
+    importCustomProvider(msg.json).then(res => sendResponse(res));
+    return true;
+  }
+  if (msg.action === 'removeCustomProvider') {
+    removeCustomProvider(msg.id).then(list => sendResponse({ providers: list }));
+    return true;
+  }
+  if (msg.action === 'makeShareCode') {
+    makeShareCode(msg.result).then(code => sendResponse({ code }));
+    return true;
+  }
+  if (msg.action === 'decodeShareCode') {
+    decodeShareCode(msg.code).then(result => sendResponse({ result }))
+      .catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+  if (msg.action === 'getTimingData') {
+    injectAndGetTimingData(msg.tabId).then(data => sendResponse({ data }));
+    return true;
+  }
 });
+
+// ── A4 improvement: scheduled watchlist re-scans ──────────────
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === WATCHLIST_ALARM) runWatchlistCheck();
+});
+ensureWatchlistAlarm();
+
+// ── B5: Right-click "Scan this domain/link" context menu ──────
+chrome.runtime.onInstalled.addListener(() => {
+  try {
+    chrome.contextMenus.create({
+      id: 'cdnwaf-scan-page',
+      title: 'Scan this domain with CDN/WAF Detector',
+      contexts: ['page']
+    });
+    chrome.contextMenus.create({
+      id: 'cdnwaf-scan-link',
+      title: 'Scan this link\u2019s domain with CDN/WAF Detector',
+      contexts: ['link']
+    });
+  } catch {}
+});
+chrome.contextMenus.onClicked.addListener(async (info) => {
+  try {
+    const target = info.menuItemId === 'cdnwaf-scan-link' ? info.linkUrl : info.pageUrl;
+    if (!target) return;
+    const hostname = new URL(target).hostname;
+    await chrome.storage.local.set({ pending_scan_domain: hostname });
+    // openPopup() requires Chrome 99+ and a recent user gesture — a context
+    // menu click satisfies that. Falls back silently (popup.js will also
+    // pick up pending_scan_domain next time the popup is opened manually).
+    if (chrome.action.openPopup) await chrome.action.openPopup();
+  } catch {}
+});
+
+// ── B4: Local "webhook" — lets OTHER pages you explicitly trust call this
+// extension directly via chrome.runtime.sendMessage(EXTENSION_ID, ...).
+// Disabled by default: manifest.json's externally_connectable.matches is
+// an empty array, so no page can reach this listener until you add your
+// own trusted origin(s) there (e.g. "https://your-internal-tool/*").
+chrome.runtime.onMessageExternal.addListener((msg, _sender, sendResponse) => {
+  if (msg?.action === 'scan' && msg.domain) {
+    performScan(msg.domain, () => {})
+      .then(r => sendResponse(r))
+      .catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+  sendResponse({ error: 'Unsupported action' });
+});
+
+// ── #18: Multi-tab correlation ─────────────────────────────────
+// Accumulates scan results for the same apex domain across different tabs
+// so the popup can surface "Tab A got Cloudflare, Tab B got Fastly for
+// the same domain" — indicates anycast routing variance by path/region.
+const tabResultsByDomain = new Map(); // apexDomain -> [{tabId, result}]
+
+function apexOf(domain) {
+  const parts = domain.split('.');
+  return parts.length > 2 ? parts.slice(-2).join('.') : domain;
+}
+
+function recordTabResult(tabId, domain, result) {
+  const apex = apexOf(domain);
+  const list = tabResultsByDomain.get(apex) || [];
+  const idx = list.findIndex(e => e.tabId === tabId);
+  const entry = { tabId, domain, result, ts: Date.now() };
+  if (idx >= 0) list[idx] = entry; else list.push(entry);
+  // Keep at most 20 tab entries per apex domain, drop oldest first
+  if (list.length > 20) list.splice(0, list.length - 20);
+  tabResultsByDomain.set(apex, list);
+}
+
+function getTabCorrelation(domain) {
+  const apex = apexOf(domain);
+  const list = tabResultsByDomain.get(apex) || [];
+  if (list.length < 2) return null;
+  // Build a set of detected-provider-id sets per tab
+  const tabSets = list.map(e => ({
+    tabId: e.tabId, domain: e.domain, ts: e.ts,
+    detected: new Set(Object.entries(e.result.providers || {})
+      .filter(([, v]) => v.verdict?.detected).map(([id]) => id))
+  }));
+  // Check for variance: any two tabs disagreeing on at least one provider
+  let hasVariance = false;
+  for (let i = 0; i < tabSets.length; i++) {
+    for (let j = i + 1; j < tabSets.length; j++) {
+      const a = tabSets[i].detected, b = tabSets[j].detected;
+      const diff = [...a].filter(id => !b.has(id)).concat([...b].filter(id => !a.has(id)));
+      if (diff.length) { hasVariance = true; break; }
+    }
+    if (hasVariance) break;
+  }
+  return {
+    apex, entryCount: list.length,
+    tabs: tabSets.map(t => ({ tabId: t.tabId, domain: t.domain, ts: t.ts, detected: [...t.detected] })),
+    hasVariance,
+    note: hasVariance
+      ? 'Different providers detected across tabs for the same apex domain — likely anycast routing variance (different PoPs or paths are being served differently).'
+      : 'All tabs for this domain show the same provider set — consistent routing.'
+  };
+}
+
+chrome.tabs.onRemoved.addListener(tabId => {
+  for (const [apex, list] of tabResultsByDomain) {
+    const filtered = list.filter(e => e.tabId !== tabId);
+    if (filtered.length) tabResultsByDomain.set(apex, filtered);
+    else tabResultsByDomain.delete(apex);
+  }
+});
+
+// ── A5: Favicon-hash corroboration for origin-leak candidates ──
+// Technique: compute a simple hash of the favicon bytes from the domain's
+// canonical favicon path, then compare against the same path on any
+// "possibly-leaking" subdomain found by checkOriginLeak(). Matching hash
+// = high confidence same origin behind different IPs — massively cuts
+// false-positives where a subdomain happens to resolve outside CDN ranges
+// but is actually a totally separate service (e.g. a marketing subdomain
+// hosted on a different provider by choice).
+//
+// We use mmh3 / FNV-1a (both royalty-free, implementable in a few lines)
+// rather than a cryptographic hash — the goal is content fingerprinting, not
+// collision resistance.
+function fnv32a(buf) {
+  let h = 0x811c9dc5;
+  for (const b of new Uint8Array(buf)) { h ^= b; h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(16).padStart(8, '0');
+}
+async function faviconHash(hostname) {
+  const paths = ['/favicon.ico', '/favicon.png', '/apple-touch-icon.png'];
+  for (const path of paths) {
+    try {
+      const res = await fetchT(`https://${hostname}${path}`, {}, 6000);
+      if (!res.ok || !res.headers.get('content-type')?.includes('image')) continue;
+      const buf = await res.arrayBuffer();
+      if (buf.byteLength < 16) continue; // skip redirect/empty stubs
+      return { path, hash: fnv32a(buf), size: buf.byteLength };
+    } catch {}
+  }
+  return null;
+}
+async function checkOriginLeakWithFavicon(domain, knownProviderRanges) {
+  const base = await checkOriginLeak(domain, knownProviderRanges);
+  if (!base.findings.length) return base;
+  const baseHash = await faviconHash(domain);
+  const enriched = await Promise.all(base.findings.map(async f => {
+    const fh = await faviconHash(f.host);
+    const sameOrigin = baseHash && fh && baseHash.hash === fh.hash;
+    return { ...f, faviconHash: fh?.hash || null, sameOrigin };
+  }));
+  return { ...base, findings: enriched, baseFaviconHash: baseHash?.hash || null };
+}
+
+// ── C5: Resource Timing signal injection (content script approach) ──
+// Extension content scripts can call performance.getEntriesByType('resource')
+// on the actual page and read nextHopProtocol (h2/h3-**/quic/http/1.1 etc.)
+// without any special permissions beyond "activeTab". This gives us the
+// *real* negotiated protocol for the main-frame connection — more reliable
+// than the Alt-Svc header heuristic used in background.js, which sees the
+// fetch() connection, not the tab's TLS session.
+// Implementation: background injects a tiny content script on-demand when
+// the popup or side panel requests timing data for the current tab.
+async function injectAndGetTimingData(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const entries = performance.getEntriesByType('navigation');
+        const nav = entries[0] || {};
+        return {
+          nextHopProtocol: nav.nextHopProtocol || null,
+          domainLookupTime: (nav.domainLookupEnd - nav.domainLookupStart) || null,
+          connectTime: (nav.connectEnd - nav.connectStart) || null,
+          ttfb: (nav.responseStart - nav.requestStart) || null,
+        };
+      },
+    });
+    return results?.[0]?.result || null;
+  } catch { return null; }
+}

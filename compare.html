@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Compare — CDN/WAF Detector</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="full-page">
+<div class="app">
+  <header class="app-header">
+    <div class="header-left"><h1>Compare 2 Domains</h1></div>
+    <div class="header-right"><span class="version-tag">v9.0</span></div>
+  </header>
+
+  <div class="compare-grid">
+    <div class="compare-col">
+      <input type="text" id="domainA" placeholder="domain-a.com">
+      <button class="scan-col-btn" data-col="A" style="background:var(--accent);color:#04141c;font-weight:700;padding:7px 14px;width:100%;">Scan A</button>
+      <div id="resultA" style="margin-top:12px"></div>
+    </div>
+    <div class="compare-col">
+      <input type="text" id="domainB" placeholder="domain-b.com">
+      <button class="scan-col-btn" data-col="B" style="background:var(--accent);color:#04141c;font-weight:700;padding:7px 14px;width:100%;">Scan B</button>
+      <div id="resultB" style="margin-top:12px"></div>
+    </div>
+  </div>
+  <div class="page-section">
+    <div id="compareSummary"></div>
+  </div>
+</div>
+<script src="provider-meta.js"></script>
+<script src="compare.js"></script>
+</body>
+</html>

@@ -578,6 +578,51 @@ const pctEl       = document.getElementById('pct');
 const barEl       = document.getElementById('pbar');
 const activityEl  = document.getElementById('activity');
 const historyBtn  = document.getElementById('history');
+const pinBtn       = document.getElementById('pinBtn');
+const pinsViewBtn  = document.getElementById('pinsViewBtn');
+const batchBtn     = document.getElementById('batchBtn');
+const compareBtn   = document.getElementById('compareBtn');
+const settingsBtn  = document.getElementById('settingsBtn');
+const themeToggle  = document.getElementById('themeToggle');
+const watchlistBtn = document.getElementById('watchlistBtn');
+const sidePanelBtn = document.getElementById('sidePanelBtn');
+
+// ── i18n: apply chrome.i18n messages to static markup ─────────
+// Scope note: only top-level chrome (buttons, headers, status copy) is
+// localized this way. The hundreds of per-signal technical labels inside
+// PROVIDER_UI stay in English, matching the convention most security/dev
+// tooling uses for protocol- and header-level terminology.
+(function applyI18n() {
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const msg = chrome.i18n.getMessage(el.dataset.i18n);
+    if (msg) el.textContent = msg;
+  });
+  document.querySelectorAll('[data-i18n-title]').forEach(el => {
+    const msg = chrome.i18n.getMessage(el.dataset.i18nTitle);
+    if (msg) { el.title = msg; el.setAttribute('aria-label', msg); }
+  });
+  document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+    const msg = chrome.i18n.getMessage(el.dataset.i18nPlaceholder);
+    if (msg) el.placeholder = msg;
+  });
+})();
+
+// ── Side panel (improvement #1) ────────────────────────────────
+// Opens the same UI in Chrome's side panel, which — unlike the popup —
+// stays open across tab switches instead of closing the instant focus
+// moves away. Falls back to a no-op with a console note on browsers
+// without chrome.sidePanel (e.g. Firefox, older Chrome).
+if (sidePanelBtn) {
+  sidePanelBtn.addEventListener('click', async () => {
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (chrome.sidePanel?.open && tab?.windowId != null) {
+        await chrome.sidePanel.open({ windowId: tab.windowId });
+      }
+    } catch (e) { console.warn('Side panel not available:', e); }
+  });
+}
+
 
 // ── Auto-fill current tab hostname ────────────────────────────
 try {
@@ -586,6 +631,59 @@ try {
     if (url && /^https?:/.test(url)) domainInput.value = new URL(url).hostname;
   });
 } catch {}
+
+// ── C1: Theme — system preference by default, persisted toggle override ──
+function applyTheme(theme) {
+  const root = document.documentElement;
+  if (theme === 'light') root.setAttribute('data-theme', 'light');
+  else if (theme === 'dark') root.removeAttribute('data-theme'); // dark is the base stylesheet
+  else { // 'system'
+    const prefersLight = window.matchMedia('(prefers-color-scheme: light)').matches;
+    if (prefersLight) root.setAttribute('data-theme', 'light');
+    else root.removeAttribute('data-theme');
+  }
+}
+chrome.runtime.sendMessage({ action: 'getSettings' }, s => {
+  applyTheme(s?.theme || 'system');
+});
+themeToggle.addEventListener('click', () => {
+  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+  const next = isLight ? 'dark' : 'light';
+  applyTheme(next);
+  chrome.runtime.sendMessage({ action: 'setSettings', patch: { theme: next } });
+});
+
+// ── C3: Pin button reflects current domain's pin state ────────
+async function refreshPinButton() {
+  const d = domainInput.value.trim().toLowerCase();
+  chrome.runtime.sendMessage({ action: 'getPins' }, res => {
+    const pinned = (res?.pins || []).includes(d);
+    pinBtn.classList.toggle('pinned', pinned);
+    pinBtn.title = pinned ? 'Unpin this domain' : 'Pin this domain';
+  });
+}
+pinBtn.addEventListener('click', () => {
+  const d = getDomain();
+  if (!d) return;
+  chrome.runtime.sendMessage({ action: 'togglePin', domain: d }, () => refreshPinButton());
+});
+domainInput.addEventListener('input', refreshPinButton);
+refreshPinButton();
+
+// ── B5: If a context-menu "Scan this domain" click queued a target while
+// the popup was closed, pick it up and scan immediately on open.
+chrome.storage.local.get('pending_scan_domain', res => {
+  const pending = res?.pending_scan_domain;
+  if (pending) {
+    chrome.storage.local.remove('pending_scan_domain');
+    domainInput.value = pending;
+    setTimeout(() => doScan(pending, false), 50); // doScan is defined later in this file
+  }
+});
+
+// ── B2 / B1: open the full-tab Compare / Batch pages ───────────
+batchBtn.addEventListener('click', () => chrome.tabs.create({ url: chrome.runtime.getURL('batch.html') }));
+compareBtn.addEventListener('click', () => chrome.tabs.create({ url: chrome.runtime.getURL('compare.html') }));
 
 // ── Validation ────────────────────────────────────────────────
 function isIPv4(s) {
@@ -645,9 +743,107 @@ function infoRow(label, value) {
 function sectionHdr(title) {
   return `<div class="section-header">${title}</div>`;
 }
+const escHtml = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+// ── B3: Export ───────────────────────────────────────────────
+function downloadBlob(filename, mime, content) {
+  const blob = new Blob([content], { type: mime });
+  const url  = URL.createObjectURL(blob);
+  chrome.downloads.download({ url, filename, saveAs: false }, () => {
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  });
+}
+function exportJson(result) {
+  const domain = domainInput.value.trim() || 'scan';
+  downloadBlob(`cdnwaf-${domain}-${Date.now()}.json`, 'application/json', JSON.stringify(result, null, 2));
+}
+function exportCsv(result) {
+  const domain = domainInput.value.trim() || 'scan';
+  const rows = [['provider', 'detected', 'score', 'label']];
+  for (const id of Object.keys(PROVIDER_UI)) {
+    const pv = result.providers?.[id];
+    if (!pv) continue;
+    rows.push([PROVIDER_UI[id].name, pv.verdict?.detected ? 'yes' : 'no', pv.verdict?.score ?? 0, pv.verdict?.label ?? '']);
+  }
+  const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
+  downloadBlob(`cdnwaf-${domain}-${Date.now()}.csv`, 'text/csv', csv);
+}
+function exportPrintable(result) {
+  // No PDF library is bundled, so this opens a clean printable report in a
+  // new tab — the person uses the browser's own "Print → Save as PDF",
+  // which is the honest zero-dependency way to get a PDF from an extension.
+  const domain   = domainInput.value.trim() || 'scan';
+  const detected = Object.keys(PROVIDER_UI).filter(id => result.providers?.[id]?.verdict?.detected);
+  const rows = Object.keys(PROVIDER_UI).map(id => {
+    const pv = result.providers?.[id];
+    if (!pv) return '';
+    return `<tr><td>${escHtml(PROVIDER_UI[id].name)}</td><td>${pv.verdict?.detected ? 'Detected' : '—'}</td><td>${pv.verdict?.score ?? 0}%</td><td>${escHtml(pv.verdict?.label ?? '')}</td></tr>`;
+  }).join('');
+  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>CDN/WAF report — ${escHtml(domain)}</title>
+  <style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;padding:32px;color:#111}
+  h1{font-size:18px}table{border-collapse:collapse;width:100%;margin-top:16px}
+  td,th{border:1px solid #ddd;padding:6px 10px;font-size:12px;text-align:left}
+  th{background:#f2f2f2}.meta{color:#666;font-size:11px;margin-bottom:4px}</style></head>
+  <body><h1>CDN / WAF Detector report</h1>
+  <div class="meta">Domain: ${escHtml(domain)}</div>
+  <div class="meta">Scanned: ${escHtml(result.scannedAt || '')}</div>
+  <div class="meta">Detected: ${detected.length ? escHtml(detected.map(id => PROVIDER_UI[id].name).join(', ')) : 'None'}</div>
+  <table><tr><th>Provider</th><th>Status</th><th>Score</th><th>Label</th></tr>${rows}</table>
+  </body></html>`;
+  const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+  chrome.tabs.create({ url });
+}
+
+// ── A2: Origin-leak on-demand check ───────────────────────────
+function renderOriginLeak(domain) {
+  resultsEl.innerHTML = `
+    <div class="detail-header">
+      <button class="back-btn" id="backBtn">← Back</button>
+      <span class="detail-name">Origin Leak Check</span>
+    </div>
+    <div class="leak-disclaimer">Probing common subdomains + Certificate Transparency logs (crt.sh) for hosts that resolve outside the IP ranges of already-detected providers. This can take a little while and does not read TLS certificates directly — browsers don't expose that to extensions.</div>
+    <div class="empty-state">Checking…</div>`;
+  document.getElementById('backBtn').addEventListener('click', () => {
+    if (resultsEl._scan) renderOverview(resultsEl._scan, resultsEl._cached, resultsEl._diff);
+  });
+  chrome.runtime.sendMessage({ action: 'checkOriginLeak', domain }, res => {
+    if (!resultsEl.querySelector('.leak-disclaimer')) return; // user navigated away
+    const findings = res?.findings || [];
+    const body = findings.length
+      ? findings.map(f => `<div class="leak-finding"><span class="leak-host">${escHtml(f.host)}</span><br><span class="leak-ip">${escHtml(f.ip)} — not in any known provider's IP range</span></div>`).join('')
+      : `<div class="leak-clean">✓ No obvious origin exposure found among ${res?.checkedCount ?? 0} candidate subdomains (${res?.ctSourceCount ?? 0} from Certificate Transparency).</div>`;
+    resultsEl.innerHTML = `
+      <div class="detail-header">
+        <button class="back-btn" id="backBtn">← Back</button>
+        <span class="detail-name">Origin Leak Check</span>
+      </div>
+      <div class="leak-disclaimer">Best-effort check only — absence of findings doesn't guarantee the origin is hidden, and the reverse: a finding here means a subdomain resolves outside known CDN ranges, not necessarily that it's the true origin.</div>
+      ${body}`;
+    document.getElementById('backBtn').addEventListener('click', () => {
+      if (resultsEl._scan) renderOverview(resultsEl._scan, resultsEl._cached, resultsEl._diff);
+    });
+  });
+}
+
+// ── D4: CVE threat-intel lookup, called from the detail view ─
+function renderCveLookup(pid, providerName) {
+  const panel = document.getElementById('cvePanel');
+  if (!panel) return;
+  panel.innerHTML = '<div class="empty-state">Looking up recent CVEs…</div>';
+  chrome.runtime.sendMessage({ action: 'getCves', providerName }, res => {
+    if (res?.error) { panel.innerHTML = `<div class="empty-state">Lookup failed: ${escHtml(res.error)}</div>`; return; }
+    const items = res?.items || [];
+    if (!items.length) { panel.innerHTML = '<div class="empty-state">No recent CVEs found via NVD keyword search.</div>'; return; }
+    panel.innerHTML = items.map(c => `
+      <div class="cve-row">
+        <span class="cve-id">${escHtml(c.id || '')}</span><span class="cve-date">${escHtml((c.published || '').slice(0, 10))}</span>
+        <div class="cve-summary">${escHtml(c.summary || '')}</div>
+      </div>`).join('') + '<div class="breakdown-note">Source: NVD keyword search on the provider name — may include unrelated results sharing the same word.</div>';
+  });
+}
 
 // ── Overview grid ─────────────────────────────────────────────
-function renderOverview(result, cached) {
+function renderOverview(result, cached, diff) {
   if (!result?.providers) {
     resultsEl.innerHTML = '<div class="empty-state">No data to display.</div>';
     return;
@@ -675,8 +871,36 @@ function renderOverview(result, cached) {
 
   const overlap = detected.length > 1
     ? `<div class="multi-warn">⚠ Multi-CDN/WAF deployment detected</div>` : '';
-  const anycastNote = ipList.length > 1
-    ? `<div class="anycast-note">${ipList.length} IPs resolved — tap an IP for cross-verification (PTR/RDAP)</div>` : '';
+
+  // ── A4: diff-vs-last-scan banner ──────────────────────────
+  let diffHtml = '';
+  if (diff) {
+    const nameOf = id => PROVIDER_UI[id]?.name || id;
+    if (diff.changed) {
+      const bits = [];
+      if (diff.added?.length)   bits.push(`<b>+${diff.added.map(nameOf).join(', ')}</b>`);
+      if (diff.removed?.length) bits.push(`<b>−${diff.removed.map(nameOf).join(', ')}</b>`);
+      diffHtml = `<div class="diff-banner changed">↻ Changed since ${new Date(diff.priorTs).toLocaleDateString()}: ${bits.join(' · ')}</div>`;
+    } else if (diff.priorTs) {
+      diffHtml = `<div class="diff-banner unchanged">✓ Same provider set as last scan (${new Date(diff.priorTs).toLocaleDateString()})</div>`;
+    }
+  }
+
+  // ── A1: layer-order chain ─────────────────────────────────
+  let chainHtml = '';
+  const lc = result.layerChain;
+  if (lc) {
+    const nameOf = id => PROVIDER_UI[id]?.name || id;
+    if (lc.chain) {
+      const hops = lc.chain.map(id => `<span class="chain-hop" style="--pc:${PROVIDER_UI[id]?.color || ''}">${nameOf(id)}</span>`)
+        .join('<span class="chain-arrow">→</span>');
+      const uncon = lc.unconfirmed?.length
+        ? `<div class="chain-unconfirmed">+ ${lc.unconfirmed.map(nameOf).join(', ')} also detected but position unconfirmed (didn't appear in Via header)</div>` : '';
+      chainHtml = `<div class="chain-row"><span class="chain-label">Layer order (visitor→origin):</span>${hops}${uncon}</div>`;
+    } else if (lc.basis === 'no-via-header' || lc.basis === 'via-incomplete') {
+      chainHtml = `<div class="chain-row"><span class="chain-unknown">Layer order unknown — Via header ${lc.basis === 'no-via-header' ? 'absent' : "didn't name enough hops"} to sequence ${detected.length} detected providers</span></div>`;
+    }
+  }
 
   const cards = order.map(id => {
     const ui    = PROVIDER_UI[id];
@@ -703,6 +927,8 @@ function renderOverview(result, cached) {
 
   const escHtml = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   const ipList = result.resolvedIPs || [];
+  const anycastNote = ipList.length > 1
+    ? `<div class="anycast-note">${ipList.length} IPs resolved — tap an IP for cross-verification (PTR/RDAP)</div>` : '';
   const ipsHtml = ipList.length
     ? `<div class="scan-ips">${ipList.map(ip => {
         const ev = result.ipEvidence?.[ip];
@@ -717,10 +943,66 @@ function renderOverview(result, cached) {
       ${ipsHtml}
     </div>`;
 
-  resultsEl.innerHTML = metaLine + overlap + anycastNote + `<div class="providers-grid">${cards}</div>`;
+  // ── DNS provider fingerprint (B6) ────────────────────────────
+  const dnsHtml = result.dnsProvider
+    ? `<div class="info-pill">🔑 DNS: <strong>${escHtml(result.dnsProvider)}</strong></div>` : '';
+
+  // ── Firefox TLS intel (B2) ────────────────────────────────────
+  let tlsHtml = '';
+  if (result.tlsIntel) {
+    const t = result.tlsIntel;
+    tlsHtml = `<div class="info-pill tls-pill">🔒 ${escHtml(t.protocol || '')} · ${escHtml(t.cipher || '')}${t.ech ? ' · ECH ✓' : ''}${t.certIssuer ? ` · Issuer: ${escHtml(t.certIssuer.slice(0, 60))}` : ''}</div>`;
+  }
+
+  // ── Migration warning (improvement #15) ──────────────────────
+  const migHtml = result.migrationWarning
+    ? `<div class="diff-banner changed">⚡ ${escHtml(result.migrationWarning.note)}</div>` : '';
+
+  // ── Custom provider hits ──────────────────────────────────────
+  const customCards = Object.entries(result.customProviders || {})
+    .filter(([, v]) => v.verdict?.detected)
+    .map(([id, v]) => `
+      <div class="provider-card detected" style="--pc:${escHtml(v.def?.color || '#94a3b8')}">
+        <div class="pc-head"><div class="pc-dot"></div>
+          <span class="pc-name">${escHtml(v.def?.name || id)}</span>
+          <span class="pc-score">${v.verdict.score}%</span></div>
+        <div class="pc-label">${escHtml(v.verdict.label)} <em style="font-size:9px">(custom)</em></div>
+      </div>`).join('');
+
+  const exportRow = `
+    <div class="export-row">
+      <button id="exportJsonBtn">⇩ JSON</button>
+      <button id="exportCsvBtn">⇩ CSV</button>
+      <button id="exportPrintBtn">⇩ Report (PDF)</button>
+      <button id="originLeakBtn">🔎 Origin leak</button>
+      <button id="shareCodeBtn">⧉ Share</button>
+    </div>`;
+
+  const infoBar = (dnsHtml || tlsHtml)
+    ? `<div class="info-bar">${dnsHtml}${tlsHtml}</div>` : '';
+
+  resultsEl.innerHTML = metaLine + diffHtml + chainHtml + migHtml + overlap + anycastNote
+    + infoBar
+    + `<div class="providers-grid">${cards}${customCards}</div>`
+    + exportRow;
+
+  document.getElementById('exportJsonBtn').addEventListener('click', () => exportJson(result));
+  document.getElementById('exportCsvBtn').addEventListener('click', () => exportCsv(result));
+  document.getElementById('exportPrintBtn').addEventListener('click', () => exportPrintable(result));
+  document.getElementById('originLeakBtn').addEventListener('click', () => renderOriginLeak(domainInput.value.trim()));
+  document.getElementById('shareCodeBtn').addEventListener('click', () => {
+    chrome.runtime.sendMessage({ action: 'makeShareCode', result }, res => {
+      if (!res?.code) return;
+      navigator.clipboard.writeText(res.code).catch(() => {});
+      const btn = document.getElementById('shareCodeBtn');
+      if (btn) { btn.textContent = '✓ Copied!'; setTimeout(() => { if (btn) btn.textContent = '⧉ Share'; }, 2000); }
+    });
+  });
 
   resultsEl.querySelectorAll('.provider-card').forEach(card =>
-    card.addEventListener('click', () => renderDetail(result, card.dataset.provider))
+    card.addEventListener('click', () => {
+      if (card.dataset.provider) renderDetail(result, card.dataset.provider);
+    })
   );
   resultsEl.querySelectorAll('.ip-chip').forEach(chip =>
     chip.addEventListener('click', () => renderIpEvidence(result, chip.dataset.ip))
@@ -761,7 +1043,7 @@ function renderIpEvidence(result, ip) {
     </div>`;
 
   document.getElementById('backBtn').addEventListener('click', () => {
-    renderOverview(resultsEl._scan, resultsEl._cached);
+    renderOverview(resultsEl._scan, resultsEl._cached, resultsEl._diff);
   });
 }
 
@@ -883,6 +1165,33 @@ function renderDetail(result, pid) {
   const productTypeHtml = ui.productType
     ? `<div class="product-type-note">${ui.productType}</div>` : '';
 
+  // ── A3: staleness warning ──────────────────────────────────
+  const decay = pv.decay;
+  const decayHtml = decay?.stale
+    ? `<div class="decay-warn">⚠ Signature last reviewed ${escHtml(decay.lastReviewed)} (~${decay.monthsAgo} months ago) — provider may have changed infrastructure since. Treat this score as possibly outdated.</div>`
+    : '';
+
+  // ── C2: confidence breakdown — approximate marginal contribution ──
+  function labelForSignal(key) {
+    for (const g of ui.groups) {
+      const found = g.signals.find(s => s.key === key);
+      if (found) return found.label;
+    }
+    return key;
+  }
+  const breakdown = pv.breakdown || [];
+  const breakdownHtml = breakdown.length ? `
+    ${sectionHdr('Confidence breakdown (approx.)')}
+    <div class="breakdown-list">
+      ${breakdown.map(b => `
+        <div class="breakdown-row">
+          <span class="bd-label">${escHtml(labelForSignal(b.signal))}</span>
+          <span class="bd-bar-wrap" style="--pc:${ui.color}"><span class="bd-bar" style="width:${Math.min(100, b.points)}%"></span></span>
+          <span class="bd-pts">+${b.points}</span>
+        </div>`).join('')}
+    </div>
+    <div class="breakdown-note">Computed by toggling each fired signal off and re-scoring — an approximation, not an exact decomposition (scoring may cap/clamp, so parts won't always sum to the total).</div>` : '';
+
   resultsEl.innerHTML = `
     <div class="detail-header" style="--pc:${ui.color}">
       <button class="back-btn" id="backBtn">← Back</button>
@@ -891,14 +1200,49 @@ function renderDetail(result, pid) {
       <span class="detail-score">${verdict.score}%</span>
     </div>
     ${productTypeHtml}
+    ${decayHtml}
     <div class="detail-verdict ${verdict.detected ? 'detected' : 'not-detected'}">${verdict.label}</div>
     <div class="checks-list">
+      ${breakdownHtml}
       ${groupsHtml}
       ${intelSection}
+      ${sectionHdr('Threat intel (D4 — beta)')}
+      <button class="link-btn" id="cveBtn">🛈 Check recent CVEs mentioning "${escHtml(ui.name)}"</button>
+      <div id="cvePanel"></div>
+      ${sectionHdr('Tab correlation')}
+      <div id="tabCorrelationPanel"><div class="breakdown-note">Loading cross-tab data…</div></div>
+      ${sectionHdr('Help improve this signature (opt-in)')}
+      <div class="breakdown-note">Noticed a header/cookie this provider isn't tracking yet? Describe it below — only sent if you've enabled crowd reporting in Settings with your own endpoint configured.</div>
+      <input type="text" id="crowdNoteInput" class="settings-input" placeholder="e.g. new header X-Foo-Edge seen on Cloudflare">
+      <button class="link-btn" id="crowdSubmitBtn">Send report</button>
     </div>`;
 
+  document.getElementById('cveBtn').addEventListener('click', () => renderCveLookup(pid, ui.name));
+
+  // Load tab correlation async
+  const domain = domainInput.value.trim();
+  chrome.runtime.sendMessage({ action: 'getTabCorrelation', domain }, res => {
+    const panel = document.getElementById('tabCorrelationPanel');
+    if (!panel) return;
+    if (!res || res.entryCount < 2) {
+      panel.innerHTML = '<div class="breakdown-note">Only one tab scanned this domain — open more tabs on the same site and re-scan to see cross-tab routing variance.</div>';
+      return;
+    }
+    const cls = res.hasVariance ? 'tab-correlation-row variance' : 'tab-correlation-row';
+    panel.innerHTML = `<div class="${cls}">${escHtml(res.note)}</div>
+      <div class="breakdown-note">${res.entryCount} tab${res.entryCount > 1 ? 's' : ''} recorded for ${escHtml(res.apex)}.</div>`;
+  });
+  document.getElementById('crowdSubmitBtn').addEventListener('click', () => {
+    const note = document.getElementById('crowdNoteInput').value.trim();
+    if (!note) return;
+    chrome.runtime.sendMessage({ action: 'submitCrowdReport', providerId: pid, notes: note }, () => {
+      document.getElementById('crowdNoteInput').value = '';
+      document.getElementById('crowdSubmitBtn').textContent = 'Sent (if reporting is enabled) ✓';
+    });
+  });
+
   document.getElementById('backBtn').addEventListener('click', () => {
-    renderOverview(resultsEl._scan, resultsEl._cached);
+    renderOverview(resultsEl._scan, resultsEl._cached, resultsEl._diff);
   });
 }
 
@@ -962,7 +1306,10 @@ function doScan(domain, forceRefresh) {
       appState.lastCached = cached;
       resultsEl._scan   = result;
       resultsEl._cached = cached;
-      renderOverview(result, cached);
+      resultsEl._diff   = msg.diff || null;
+      renderOverview(result, cached, msg.diff || null);
+      refreshPinButton();
+      addWatchButton(domain || domainInput.value.trim());
 
     } else if (msg.type === 'error') {
       setUiIdle();
@@ -1044,7 +1391,7 @@ function renderHistory(list) {
       </div>
       <div class="empty-state">No scans yet.</div>`;
     document.getElementById('backBtn').addEventListener('click', () => {
-      if (resultsEl._scan) renderOverview(resultsEl._scan, resultsEl._cached);
+      if (resultsEl._scan) renderOverview(resultsEl._scan, resultsEl._cached, resultsEl._diff);
       else resultsEl.innerHTML = '';
     });
     return;
@@ -1074,7 +1421,7 @@ function renderHistory(list) {
     <div class="checks-list history-list">${rows}</div>`;
 
   document.getElementById('backBtn').addEventListener('click', () => {
-    if (resultsEl._scan) renderOverview(resultsEl._scan, resultsEl._cached);
+    if (resultsEl._scan) renderOverview(resultsEl._scan, resultsEl._cached, resultsEl._diff);
     else resultsEl.innerHTML = '';
   });
   document.getElementById('clearHistoryBtn').addEventListener('click', () => {
@@ -1094,3 +1441,275 @@ historyBtn.addEventListener('click', () => {
     renderHistory(res?.history || []);
   });
 });
+
+// ── C3: Pinned domains view ───────────────────────────────────
+function renderPins(list) {
+  if (!list.length) {
+    resultsEl.innerHTML = `
+      <div class="detail-header">
+        <button class="back-btn" id="backBtn">← Back</button>
+        <span class="detail-name">Pinned Domains</span>
+      </div>
+      <div class="empty-state">No pinned domains yet — tap the ★ next to a domain to pin it.</div>`;
+    document.getElementById('backBtn').addEventListener('click', () => {
+      if (resultsEl._scan) renderOverview(resultsEl._scan, resultsEl._cached, resultsEl._diff);
+      else resultsEl.innerHTML = '';
+    });
+    return;
+  }
+  const rows = list.map(d => `
+    <div class="history-row" data-domain="${escHtml(d)}">
+      <div class="history-row-top"><strong>${escHtml(d)}</strong></div>
+    </div>`).join('');
+  resultsEl.innerHTML = `
+    <div class="detail-header">
+      <button class="back-btn" id="backBtn">← Back</button>
+      <span class="detail-name">Pinned Domains</span>
+    </div>
+    <div class="checks-list history-list">${rows}</div>`;
+  document.getElementById('backBtn').addEventListener('click', () => {
+    if (resultsEl._scan) renderOverview(resultsEl._scan, resultsEl._cached, resultsEl._diff);
+    else resultsEl.innerHTML = '';
+  });
+  resultsEl.querySelectorAll('.history-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const d = row.dataset.domain;
+      domainInput.value = d;
+      doScan(d, false);
+    });
+  });
+}
+pinsViewBtn.addEventListener('click', () => {
+  chrome.runtime.sendMessage({ action: 'getPins' }, res => renderPins(res?.pins || []));
+});
+
+// ── Settings view (expanded for v9.1) ─────────────────────────
+function renderSettings(settings) {
+  resultsEl.innerHTML = `
+    <div class="detail-header">
+      <button class="back-btn" id="backBtn">← Back</button>
+      <span class="detail-name">Settings</span>
+    </div>
+    <div class="checks-list">
+      <div class="settings-section-title">Appearance</div>
+      <div class="settings-row">
+        <span class="settings-label">Theme</span>
+        <select id="themeSelect" class="settings-input" style="width:auto;margin-top:0">
+          <option value="system">System</option>
+          <option value="dark">Dark</option>
+          <option value="light">Light</option>
+        </select>
+      </div>
+
+      <div class="settings-section-title">Passive ambient detection (beta)</div>
+      <div class="settings-row">
+        <span class="settings-label">Enable ambient mode
+          <span class="settings-hint">Silently fingerprints CDN/WAF on every page you browse using read-only header observation — no Scan button needed. Badge shows provider count per tab. All data is local and cleared when you close the tab. Off by default.</span>
+        </span>
+        <label class="toggle-switch"><input type="checkbox" id="ambientToggle"><span class="slider"></span></label>
+      </div>
+
+      <div class="settings-section-title">Watchlist auto-rescan interval</div>
+      <div class="settings-row">
+        <span class="settings-label">Re-check every
+          <span class="settings-hint">Minimum 60 minutes. Notifies you when a watched domain's detected provider set changes.</span>
+        </span>
+        <select id="watchIntervalSelect" class="settings-input" style="width:auto;margin-top:0">
+          <option value="60">1 hour</option>
+          <option value="180">3 hours</option>
+          <option value="360">6 hours</option>
+          <option value="720">12 hours</option>
+          <option value="1440">24 hours</option>
+        </select>
+      </div>
+
+      <div class="settings-section-title">Crowd-sourced signatures (opt-in)</div>
+      <div class="settings-row">
+        <span class="settings-label">Enable reporting
+          <span class="settings-hint">Sends only a provider ID + a short note you write — never your domain or IP. Requires your own deployed endpoint (see /worker/README.md).</span>
+        </span>
+        <label class="toggle-switch"><input type="checkbox" id="crowdToggle"><span class="slider"></span></label>
+      </div>
+      <input type="text" id="crowdEndpointInput" class="settings-input" placeholder="https://your-worker.example.workers.dev/report">
+
+      <div class="settings-section-title">Import a scan code</div>
+      <div class="breakdown-note">Paste a share code (generated via the ⧉ Share button) to view a scan result from another session or machine.</div>
+      <textarea id="importCodeArea" class="share-code-area" placeholder="Paste share code here…" rows="3"></textarea>
+      <button class="btn-primary-sm" id="importCodeBtn">Load scan</button>
+      <div id="importCodeResult"></div>
+
+      <div class="settings-section-title">About</div>
+      <div class="breakdown-note">CDN/WAF Detector v9.1 — local scoring only, no telemetry by default. Origin-leak and CVE lookups call public third-party services (crt.sh, NVD) only when you trigger them. Firefox TLS intel uses webRequest.getSecurityInfo() — Chrome-only installs will never see that field.</div>
+    </div>`;
+
+  document.getElementById('themeSelect').value = settings.theme || 'system';
+  document.getElementById('crowdToggle').checked = !!settings.crowdReportEnabled;
+  document.getElementById('crowdEndpointInput').value = settings.crowdReportEndpoint || '';
+  document.getElementById('ambientToggle').checked = !!settings.ambientModeEnabled;
+  document.getElementById('watchIntervalSelect').value = String(settings.watchlistIntervalMin || 360);
+
+  document.getElementById('themeSelect').addEventListener('change', e => {
+    applyTheme(e.target.value);
+    chrome.runtime.sendMessage({ action: 'setSettings', patch: { theme: e.target.value } });
+  });
+  document.getElementById('crowdToggle').addEventListener('change', e => {
+    chrome.runtime.sendMessage({ action: 'setSettings', patch: { crowdReportEnabled: e.target.checked } });
+  });
+  document.getElementById('crowdEndpointInput').addEventListener('change', e => {
+    chrome.runtime.sendMessage({ action: 'setSettings', patch: { crowdReportEndpoint: e.target.value.trim() } });
+  });
+  document.getElementById('ambientToggle').addEventListener('change', e => {
+    chrome.runtime.sendMessage({ action: 'setSettings', patch: { ambientModeEnabled: e.target.checked } });
+  });
+  document.getElementById('watchIntervalSelect').addEventListener('change', e => {
+    chrome.runtime.sendMessage({ action: 'setSettings', patch: { watchlistIntervalMin: Number(e.target.value) } });
+  });
+  document.getElementById('importCodeBtn').addEventListener('click', () => {
+    const code = document.getElementById('importCodeArea').value.trim();
+    const el = document.getElementById('importCodeResult');
+    if (!code) { el.textContent = 'Paste a code first.'; return; }
+    el.textContent = 'Loading…';
+    chrome.runtime.sendMessage({ action: 'decodeShareCode', code }, res => {
+      if (res?.error) { el.innerHTML = `<div class="import-result-err">Error: ${escHtml(res.error)}</div>`; return; }
+      resultsEl._scan = res.result; resultsEl._cached = false; resultsEl._diff = null;
+      renderOverview(res.result, false, null);
+    });
+  });
+  document.getElementById('backBtn').addEventListener('click', () => {
+    if (resultsEl._scan) renderOverview(resultsEl._scan, resultsEl._cached, resultsEl._diff);
+    else resultsEl.innerHTML = '';
+  });
+}
+settingsBtn.addEventListener('click', () => {
+  chrome.runtime.sendMessage({ action: 'getSettings' }, s => renderSettings(s || {}));
+});
+
+// ── Watchlist view ─────────────────────────────────────────────
+function renderWatchlist(list) {
+  const backBtn = () => {
+    if (resultsEl._scan) renderOverview(resultsEl._scan, resultsEl._cached, resultsEl._diff);
+    else resultsEl.innerHTML = '';
+  };
+  const rows = list.length
+    ? list.map(d => `
+        <div class="watchlist-row">
+          <span class="wr-domain">${escHtml(d)}</span>
+          <div class="wr-actions">
+            <button class="wr-btn" data-action="scan" data-domain="${escHtml(d)}">Scan now</button>
+            <button class="wr-btn" data-action="remove" data-domain="${escHtml(d)}">Remove</button>
+          </div>
+        </div>`).join('')
+    : '<div class="empty-state">No watched domains yet — use the 👁 button next to a scan result to add one.</div>';
+
+  resultsEl.innerHTML = `
+    <div class="detail-header">
+      <button class="back-btn" id="backBtn">← Back</button>
+      <span class="detail-name">Watchlist</span>
+      <button class="link-btn" id="rescanAllBtn" style="margin-left:auto;font-size:10px">↻ Re-scan all now</button>
+    </div>
+    <div class="breakdown-note">Watched domains are re-scanned automatically. You get a notification when their detected provider set changes.</div>
+    <div id="watchlistRows">${rows}</div>`;
+
+  document.getElementById('backBtn').addEventListener('click', backBtn);
+  document.getElementById('rescanAllBtn')?.addEventListener('click', () => {
+    chrome.runtime.sendMessage({ action: 'runWatchlistNow' }, () => {
+      const btn = document.getElementById('rescanAllBtn');
+      if (btn) btn.textContent = '✓ Done';
+    });
+  });
+  resultsEl.querySelectorAll('.wr-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const d = btn.dataset.domain;
+      if (btn.dataset.action === 'scan') { domainInput.value = d; doScan(d, false); }
+      if (btn.dataset.action === 'remove') {
+        chrome.runtime.sendMessage({ action: 'toggleWatch', domain: d }, res => renderWatchlist(res?.watchlist || []));
+      }
+    });
+  });
+}
+if (watchlistBtn) {
+  watchlistBtn.addEventListener('click', () => {
+    chrome.runtime.sendMessage({ action: 'getWatchlist' }, res => renderWatchlist(res?.watchlist || []));
+  });
+}
+
+// ── Ambient mode banner in popup when enabled ──────────────────
+chrome.runtime.sendMessage({ action: 'getSettings' }, s => {
+  if (s?.ambientModeEnabled) {
+    const banner = document.createElement('div');
+    banner.className = 'ambient-banner';
+    banner.textContent = '● Passive ambient detection is ON — badge shows CDN/WAF count per tab';
+    const statusBar = document.getElementById('status-bar');
+    if (statusBar) statusBar.parentNode.insertBefore(banner, statusBar);
+  }
+});
+
+// ── Watchlist button wired to current scan result ──────────────
+// Popup adds a small "👁 Watch" inline button in the export row once a
+// scan completes (handled here since we need the result in scope).
+function addWatchButton(domain) {
+  const exportRow = resultsEl.querySelector('.export-row');
+  if (!exportRow || exportRow.querySelector('#watchInlineBtn')) return;
+  const btn = document.createElement('button');
+  btn.id = 'watchInlineBtn';
+  btn.textContent = '👁 Watch';
+  btn.title = 'Add to watchlist for auto re-scan notifications';
+  exportRow.appendChild(btn);
+  chrome.runtime.sendMessage({ action: 'getWatchlist' }, res => {
+    if ((res?.watchlist || []).includes(domain)) btn.textContent = '👁 Watching';
+  });
+  btn.addEventListener('click', () => {
+    chrome.runtime.sendMessage({ action: 'toggleWatch', domain }, res => {
+      const watching = (res?.watchlist || []).includes(domain);
+      btn.textContent = watching ? '👁 Watching' : '👁 Watch';
+    });
+  });
+}
+
+// Custom provider management page (accessible from Settings)
+function renderCustomProviders(providers) {
+  const rows = providers.length
+    ? providers.map(p => `
+        <div class="watchlist-row">
+          <span class="wr-domain" style="color:${escHtml(p.color)}">${escHtml(p.name)}</span>
+          <div class="wr-actions">
+            <button class="wr-btn remove-custom" data-id="${escHtml(p.id)}">Remove</button>
+          </div>
+        </div>`).join('')
+    : '<div class="empty-state">No custom provider packs imported yet.</div>';
+
+  resultsEl.innerHTML = `
+    <div class="detail-header">
+      <button class="back-btn" id="backBtn">← Back</button>
+      <span class="detail-name">Custom Providers</span>
+    </div>
+    ${rows}
+    ${sectionHdr('Import a provider pack (JSON)')}
+    <div class="breakdown-note">Must match the custom provider schema. See CHANGELOG.md for the supported fields: id (custom_*), name, color, cnamePatterns [{pattern, points}], headerChecks [{header, valuePattern?, points}].</div>
+    <textarea id="cpJsonArea" class="import-json-area" placeholder='{"id":"custom_mycdn","name":"MyCDN","cnamePatterns":[{"pattern":"\\.mycdn\\.net$","points":80}]}'></textarea>
+    <button class="btn-primary-sm" id="cpImportBtn">Import</button>
+    <div id="cpResult"></div>`;
+
+  document.getElementById('backBtn').addEventListener('click', () => {
+    chrome.runtime.sendMessage({ action: 'getSettings' }, s => renderSettings(s || {}));
+  });
+  document.getElementById('cpImportBtn').addEventListener('click', () => {
+    const json = document.getElementById('cpJsonArea').value.trim();
+    chrome.runtime.sendMessage({ action: 'importCustomProvider', json }, res => {
+      const el = document.getElementById('cpResult');
+      if (res?.ok) {
+        el.innerHTML = `<div class="import-result-ok">✓ Imported "${escHtml(res.provider.name)}" (${escHtml(res.provider.id)})</div>`;
+        chrome.runtime.sendMessage({ action: 'getCustomProviders' }, r => renderCustomProviders(r?.providers || []));
+      } else {
+        el.innerHTML = `<div class="import-result-err">Error: ${escHtml(res?.error || 'unknown')}</div>`;
+      }
+    });
+  });
+  resultsEl.querySelectorAll('.remove-custom').forEach(btn => {
+    btn.addEventListener('click', () => {
+      chrome.runtime.sendMessage({ action: 'removeCustomProvider', id: btn.dataset.id }, res => {
+        renderCustomProviders(res?.providers || []);
+      });
+    });
+  });
+}
