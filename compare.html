@@ -2,31 +2,52 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Compare — CDN/WAF Detector</title>
+<title>Compare Domains — CDN/WAF Detector</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="fullpage.css">
 </head>
-<body class="full-page">
+<body>
 <div class="app">
   <header class="app-header">
-    <div class="header-left"><h1>Compare 2 Domains</h1></div>
-    <div class="header-right"><span class="version-tag">v9.0</span></div>
+    <div class="header-left"><h1>⇄ Compare 2 Domains</h1></div>
+    <div class="header-right"><span class="version-tag">v9.1</span></div>
   </header>
 
-  <div class="compare-grid">
-    <div class="compare-col">
-      <input type="text" id="domainA" placeholder="domain-a.com">
-      <button class="scan-col-btn" data-col="A" style="background:var(--accent);color:#04141c;font-weight:700;padding:7px 14px;width:100%;">Scan A</button>
-      <div id="resultA" style="margin-top:12px"></div>
+  <div class="fullpage-body">
+    <div class="compare-split">
+      <!-- Column A -->
+      <div class="compare-col">
+        <div class="compare-col-title">Domain A</div>
+        <input type="text" id="domainA" class="col-domain-input" placeholder="domain-a.com" spellcheck="false">
+        <button class="btn-scan-col scan-col-btn" data-col="A">Scan A</button>
+        <div id="resultA" class="col-result-list"></div>
+      </div>
+
+      <!-- Column B -->
+      <div class="compare-col">
+        <div class="compare-col-title">Domain B</div>
+        <input type="text" id="domainB" class="col-domain-input" placeholder="domain-b.com" spellcheck="false">
+        <button class="btn-scan-col scan-col-btn" data-col="B">Scan B</button>
+        <div id="resultB" class="col-result-list"></div>
+      </div>
     </div>
-    <div class="compare-col">
-      <input type="text" id="domainB" placeholder="domain-b.com">
-      <button class="scan-col-btn" data-col="B" style="background:var(--accent);color:#04141c;font-weight:700;padding:7px 14px;width:100%;">Scan B</button>
-      <div id="resultB" style="margin-top:12px"></div>
+
+    <!-- Summary (shown once both sides have scanned) -->
+    <div id="compareSummary" class="compare-summary" hidden>
+      <div class="summary-section" id="sumShared">
+        <div class="summary-section-title">Used by both</div>
+        <div class="summary-chips" id="chipsShared"></div>
+      </div>
+      <div class="summary-section" id="sumOnlyA">
+        <div class="summary-section-title">Only in A</div>
+        <div class="summary-chips" id="chipsOnlyA"></div>
+      </div>
+      <div class="summary-section" id="sumOnlyB">
+        <div class="summary-section-title">Only in B</div>
+        <div class="summary-chips" id="chipsOnlyB"></div>
+      </div>
     </div>
-  </div>
-  <div class="page-section">
-    <div id="compareSummary"></div>
   </div>
 </div>
 <script src="provider-meta.js"></script>

@@ -954,6 +954,36 @@ function renderOverview(result, cached, diff) {
     tlsHtml = `<div class="info-pill tls-pill">🔒 ${escHtml(t.protocol || '')} · ${escHtml(t.cipher || '')}${t.ech ? ' · ECH ✓' : ''}${t.certIssuer ? ` · Issuer: ${escHtml(t.certIssuer.slice(0, 60))}` : ''}</div>`;
   }
 
+  // ── A1: HTTPS DNS record — ECH, ALPN, IP hints ───────────────
+  let httpsRecordHtml = '';
+  if (result.httpsRecord) {
+    const hr = result.httpsRecord;
+    const bits = [];
+    if (hr.ech)  bits.push('<strong>ECH ✓</strong>');
+    if (hr.alpn.length) bits.push(`ALPN: ${hr.alpn.map(escHtml).join(', ')}`);
+    if (hr.ipv4hints.length) bits.push(`IP hints: ${hr.ipv4hints.map(escHtml).join(', ')}`);
+    if (bits.length) httpsRecordHtml = `<div class="info-pill">📋 HTTPS RR: ${bits.join(' · ')}</div>`;
+  }
+
+  // ── A4: SPF / DMARC ──────────────────────────────────────────
+  let spfHtml = '';
+  if (result.spfDmarc) {
+    const sd = result.spfDmarc;
+    const bits = [];
+    if (sd.spfProvider) bits.push(`✉ Email: <strong>${escHtml(sd.spfProvider)}</strong>`);
+    if (sd.dmarcPolicy) bits.push(`DMARC: p=${escHtml(sd.dmarcPolicy)}`);
+    if (bits.length) spfHtml = `<div class="info-pill">${bits.join(' · ')}</div>`;
+  }
+
+  // ── A5: Anycast multi-resolver divergence ─────────────────────
+  let anycastRrHtml = '';
+  if (result.anycast?.diverges) {
+    const rows = result.anycast.entries.map(e =>
+      `${escHtml(e.resolver)}: ${e.ips.map(escHtml).join(', ')}`
+    ).join(' | ');
+    anycastRrHtml = `<div class="diff-banner changed">🌐 Anycast divergence: ${rows}</div>`;
+  }
+
   // ── Migration warning (improvement #15) ──────────────────────
   const migHtml = result.migrationWarning
     ? `<div class="diff-banner changed">⚡ ${escHtml(result.migrationWarning.note)}</div>` : '';
@@ -973,23 +1003,29 @@ function renderOverview(result, cached, diff) {
     <div class="export-row">
       <button id="exportJsonBtn">⇩ JSON</button>
       <button id="exportCsvBtn">⇩ CSV</button>
-      <button id="exportPrintBtn">⇩ Report (PDF)</button>
+      <button id="exportMdBtn">⇩ Markdown</button>
+      <button id="exportPrintBtn">⇩ Report</button>
       <button id="originLeakBtn">🔎 Origin leak</button>
       <button id="shareCodeBtn">⧉ Share</button>
+      <button id="timelineBtn">📅 Timeline</button>
+      <button id="treeBtn">🌲 Tree</button>
     </div>`;
 
-  const infoBar = (dnsHtml || tlsHtml)
-    ? `<div class="info-bar">${dnsHtml}${tlsHtml}</div>` : '';
+  const infoBar = (dnsHtml || tlsHtml || httpsRecordHtml || spfHtml)
+    ? `<div class="info-bar">${dnsHtml}${httpsRecordHtml}${spfHtml}${tlsHtml}</div>` : '';
 
-  resultsEl.innerHTML = metaLine + diffHtml + chainHtml + migHtml + overlap + anycastNote
+  resultsEl.innerHTML = metaLine + diffHtml + chainHtml + anycastRrHtml + migHtml + overlap + anycastNote
     + infoBar
     + `<div class="providers-grid">${cards}${customCards}</div>`
     + exportRow;
 
   document.getElementById('exportJsonBtn').addEventListener('click', () => exportJson(result));
   document.getElementById('exportCsvBtn').addEventListener('click', () => exportCsv(result));
+  document.getElementById('exportMdBtn').addEventListener('click', () => exportMarkdown(result));
   document.getElementById('exportPrintBtn').addEventListener('click', () => exportPrintable(result));
   document.getElementById('originLeakBtn').addEventListener('click', () => renderOriginLeak(domainInput.value.trim()));
+  document.getElementById('timelineBtn').addEventListener('click', () => renderTimeline(domainInput.value.trim()));
+  document.getElementById('treeBtn').addEventListener('click', () => renderTree(result, domainInput.value.trim()));
   document.getElementById('shareCodeBtn').addEventListener('click', () => {
     chrome.runtime.sendMessage({ action: 'makeShareCode', result }, res => {
       if (!res?.code) return;
@@ -1206,9 +1242,17 @@ function renderDetail(result, pid) {
       ${breakdownHtml}
       ${groupsHtml}
       ${intelSection}
-      ${sectionHdr('Threat intel (D4 — beta)')}
-      <button class="link-btn" id="cveBtn">🛈 Check recent CVEs mentioning "${escHtml(ui.name)}"</button>
+      ${sectionHdr('Threat intel — CVEs (D4)')}
+      <button class="link-btn" id="cveBtn">🛈 Check recent CVEs for "${escHtml(ui.name)}" via NVD</button>
       <div id="cvePanel"></div>
+      ${sectionHdr('Threat intel — IP lookup (D3)')}
+      ${(result.resolvedIPs || []).length
+        ? `<div class="breakdown-note">Click an IP to query Shodan InternetDB (free) + optional Shodan/Censys full API (keys in Settings):</div>
+           <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px">
+           ${(result.resolvedIPs).map(ip => `<button class="link-btn ip-threat-btn" data-ip="${escHtml(ip)}">${escHtml(ip)}</button>`).join('')}
+           </div>
+           <div id="threatIntelPanel"></div>`
+        : '<div class="breakdown-note">No resolved IPs for this scan.</div>'}
       ${sectionHdr('Tab correlation')}
       <div id="tabCorrelationPanel"><div class="breakdown-note">Loading cross-tab data…</div></div>
       ${sectionHdr('Help improve this signature (opt-in)')}
@@ -1218,6 +1262,10 @@ function renderDetail(result, pid) {
     </div>`;
 
   document.getElementById('cveBtn').addEventListener('click', () => renderCveLookup(pid, ui.name));
+  // D3: wire IP threat intel buttons
+  resultsEl.querySelectorAll('.ip-threat-btn').forEach(btn => {
+    btn.addEventListener('click', () => renderThreatIntel(btn.dataset.ip));
+  });
 
   // Load tab correlation async
   const domain = domainInput.value.trim();
@@ -1539,7 +1587,17 @@ function renderSettings(settings) {
       <div id="importCodeResult"></div>
 
       <div class="settings-section-title">About</div>
-      <div class="breakdown-note">CDN/WAF Detector v9.1 — local scoring only, no telemetry by default. Origin-leak and CVE lookups call public third-party services (crt.sh, NVD) only when you trigger them. Firefox TLS intel uses webRequest.getSecurityInfo() — Chrome-only installs will never see that field.</div>
+      <div class="breakdown-note">CDN/WAF Detector v9.1 — local scoring only, no telemetry by default.<br>
+      Keyboard shortcuts: <strong>Ctrl+Shift+S</strong> open popup · <strong>Ctrl+Shift+D</strong> side panel · <strong>Ctrl+Shift+V</strong> scan clipboard.</div>
+
+      <div class="settings-section-title">Threat intel API keys (D3 — optional)</div>
+      <div class="breakdown-note">Keys are stored locally and sent only to Shodan/Censys when you click an IP lookup. Leave blank to use only the free Shodan InternetDB (no key needed).</div>
+      <div class="settings-row"><span class="settings-label">Shodan API key<span class="settings-hint">api.shodan.io — free tier available</span></span></div>
+      <input type="password" id="shodanKeyInput" class="settings-input" placeholder="Your Shodan API key">
+      <div class="settings-row" style="margin-top:8px"><span class="settings-label">Censys API ID<span class="settings-hint">search.censys.io</span></span></div>
+      <input type="text" id="censysIdInput" class="settings-input" placeholder="Censys API ID">
+      <div class="settings-row" style="margin-top:6px"><span class="settings-label">Censys API Secret</span></div>
+      <input type="password" id="censysSecretInput" class="settings-input" placeholder="Censys API secret" style="margin-bottom:8px">
     </div>`;
 
   document.getElementById('themeSelect').value = settings.theme || 'system';
@@ -1563,6 +1621,17 @@ function renderSettings(settings) {
   });
   document.getElementById('watchIntervalSelect').addEventListener('change', e => {
     chrome.runtime.sendMessage({ action: 'setSettings', patch: { watchlistIntervalMin: Number(e.target.value) } });
+  });
+  // D3 API key inputs
+  document.getElementById('shodanKeyInput').value  = settings.shodanApiKey    || '';
+  document.getElementById('censysIdInput').value   = settings.censysApiId     || '';
+  document.getElementById('censysSecretInput').value = settings.censysApiSecret || '';
+  ['shodanKeyInput','censysIdInput','censysSecretInput'].forEach(id => {
+    const field = id.replace('Input', '').replace('shodan','shodanApi').replace('censysId','censysApiId').replace('censysSecret','censysApiSecret');
+    const keyMap = { shodanKeyInput: 'shodanApiKey', censysIdInput: 'censysApiId', censysSecretInput: 'censysApiSecret' };
+    document.getElementById(id).addEventListener('change', e => {
+      chrome.runtime.sendMessage({ action: 'setSettings', patch: { [keyMap[id]]: e.target.value.trim() } });
+    });
   });
   document.getElementById('importCodeBtn').addEventListener('click', () => {
     const code = document.getElementById('importCodeArea').value.trim();
@@ -1713,3 +1782,251 @@ function renderCustomProviders(providers) {
     });
   });
 }
+
+// ════════════════════════════════════════════════════════════════
+// Round-3 popup additions
+// ════════════════════════════════════════════════════════════════
+
+// ── B3: Clipboard scan ────────────────────────────────────────
+// Reads clipboard text, extracts first domain/IP candidate, scans it.
+// Called from the clipboard button in the header or via keyboard shortcut.
+async function scanFromClipboard() {
+  try {
+    const text = await navigator.clipboard.readText();
+    const match = text.trim().match(/([a-zA-Z0-9][a-zA-Z0-9\-\.]{0,253}\.[a-zA-Z]{2,}|\d{1,3}(?:\.\d{1,3}){3})/);
+    if (!match) {
+      statusTextEl.className = 'status-fail';
+      statusTextEl.textContent = chrome.i18n.getMessage('statusInvalid') || 'No domain/IP found in clipboard';
+      return;
+    }
+    const candidate = match[1].toLowerCase();
+    domainInput.value = candidate;
+    doScan(candidate, false);
+  } catch (e) {
+    // Clipboard permission denied — fall back to prompting the user
+    domainInput.focus();
+    domainInput.placeholder = 'Paste domain here…';
+  }
+}
+
+// Wire clipboard scan to pending flag (set by keyboard shortcut in SW)
+chrome.storage.local.get('clipboard_scan_pending', res => {
+  if (res?.clipboard_scan_pending) {
+    chrome.storage.local.remove('clipboard_scan_pending');
+    scanFromClipboard();
+  }
+});
+
+// ── B4: Markdown export ───────────────────────────────────────
+function exportMarkdown(result) {
+  const domain  = domainInput.value.trim() || 'scan';
+  const order   = Object.keys(PROVIDER_UI);
+  const detected = order.filter(id => result.providers?.[id]?.verdict?.detected);
+
+  let md = `# CDN / WAF Report — ${domain}\n\n`;
+  md += `**Scanned:** ${result.scannedAt || ''}\n\n`;
+  md += `**IPs:** ${(result.resolvedIPs || []).join(', ') || '—'}\n\n`;
+
+  if (result.dnsProvider) md += `**DNS Provider:** ${result.dnsProvider}\n\n`;
+  if (result.spfDmarc?.spfProvider) md += `**Email Provider (SPF):** ${result.spfDmarc.spfProvider}\n\n`;
+  if (result.spfDmarc?.dmarcPolicy) md += `**DMARC Policy:** p=${result.spfDmarc.dmarcPolicy}\n\n`;
+  if (result.httpsRecord?.ech) md += `**ECH (Encrypted Client Hello):** Enabled\n\n`;
+  if (result.httpsRecord?.alpn?.length) md += `**ALPN:** ${result.httpsRecord.alpn.join(', ')}\n\n`;
+
+  if (result.layerChain?.chain) {
+    md += `**Layer order (visitor→origin):** ${result.layerChain.chain.map(id => PROVIDER_UI[id]?.name || id).join(' → ')}\n\n`;
+  }
+
+  md += `## Detected Providers\n\n`;
+  if (!detected.length) {
+    md += '_None detected._\n\n';
+  } else {
+    md += '| Provider | Score | Label |\n|---|---|---|\n';
+    for (const id of detected) {
+      const v = result.providers[id].verdict;
+      md += `| ${PROVIDER_UI[id]?.name || id} | ${v.score}% | ${v.label} |\n`;
+    }
+    md += '\n';
+  }
+
+  md += `## All Providers\n\n`;
+  md += '| Provider | Score | Detected |\n|---|---|---|\n';
+  for (const id of order) {
+    const v = result.providers?.[id]?.verdict;
+    if (!v) continue;
+    md += `| ${PROVIDER_UI[id]?.name || id} | ${v.score}% | ${v.detected ? '✓' : '—'} |\n`;
+  }
+
+  const blob = new Blob([md], { type: 'text/markdown' });
+  const url  = URL.createObjectURL(blob);
+  chrome.downloads.download({ url, filename: `cdnwaf-${domain}-${Date.now()}.md` }, () => {
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  });
+}
+
+// ── D1: Timeline / snapshot diff view ─────────────────────────
+function renderTimeline(domain) {
+  if (!domain) return;
+  resultsEl.innerHTML = `
+    <div class="detail-header">
+      <button class="back-btn" id="backBtn">← Back</button>
+      <span class="detail-name">📅 Timeline — ${escHtml(domain)}</span>
+    </div>
+    <div class="empty-state">Loading snapshots…</div>`;
+  document.getElementById('backBtn').addEventListener('click', () => {
+    if (resultsEl._scan) renderOverview(resultsEl._scan, resultsEl._cached, resultsEl._diff);
+  });
+
+  chrome.runtime.sendMessage({ action: 'getSnapshotHistory', domain }, res => {
+    const snaps = res?.snapshots || [];
+    if (!snaps.length) {
+      resultsEl.querySelector('.empty-state').textContent = 'No snapshots yet — scan this domain a few times to build a timeline.';
+      return;
+    }
+
+    const rows = snaps.map((s, i) => {
+      const detected = Object.entries(s.result?.providers || {})
+        .filter(([, v]) => v.verdict?.detected)
+        .map(([id]) => PROVIDER_UI[id]?.name || id);
+      const prev = snaps[i + 1];
+      let diffTag = '';
+      if (prev) {
+        const prevDet = new Set(Object.entries(prev.result?.providers || {})
+          .filter(([, v]) => v.verdict?.detected).map(([id]) => id));
+        const curDet  = new Set(Object.entries(s.result?.providers || {})
+          .filter(([, v]) => v.verdict?.detected).map(([id]) => id));
+        const added   = [...curDet].filter(id => !prevDet.has(id));
+        const removed = [...prevDet].filter(id => !curDet.has(id));
+        if (added.length || removed.length) {
+          diffTag = ` <span class="diff-banner changed" style="display:inline;padding:1px 6px;font-size:9.5px">`
+            + (added.length   ? `+${added.map(id => PROVIDER_UI[id]?.name || id).join(',')} ` : '')
+            + (removed.length ? `−${removed.map(id => PROVIDER_UI[id]?.name || id).join(',')}` : '')
+            + '</span>';
+        }
+      }
+      return `<div class="history-row">
+        <div class="history-row-top">
+          <span>${new Date(s.ts).toLocaleString()}</span>${diffTag}
+        </div>
+        <div style="font-size:11px;color:var(--text-dim);margin-top:3px">
+          ${detected.length ? escHtml(detected.join(', ')) : 'None detected'}
+          ${s.result?.dnsProvider ? ` · DNS: ${escHtml(s.result.dnsProvider)}` : ''}
+        </div>
+      </div>`;
+    }).join('');
+
+    resultsEl.innerHTML = `
+      <div class="detail-header">
+        <button class="back-btn" id="backBtn">← Back</button>
+        <span class="detail-name">📅 Timeline — ${escHtml(domain)}</span>
+      </div>
+      <div class="checks-list history-list">${rows}</div>`;
+    document.getElementById('backBtn').addEventListener('click', () => {
+      if (resultsEl._scan) renderOverview(resultsEl._scan, resultsEl._cached, resultsEl._diff);
+    });
+  });
+}
+
+// ── D3: Threat intel panel in provider detail ─────────────────
+function renderThreatIntel(ip) {
+  const panel = document.getElementById('threatIntelPanel');
+  if (!panel) return;
+  panel.innerHTML = '<div class="empty-state">Querying Shodan InternetDB…</div>';
+  chrome.runtime.sendMessage({ action: 'queryThreatIntel', ip }, res => {
+    if (!panel.closest('#results')) return; // navigated away
+    const si = res?.shodanInternetDb;
+    const sh = res?.shodan;
+    const ce = res?.censys;
+    let html = '';
+
+    if (si && !si.detail) {
+      // Shodan InternetDB (free, no key)
+      const ports = (si.ports || []).join(', ') || '—';
+      const vulns = (si.vulns || []).slice(0, 5).map(v => `<span class="info-pill" style="color:var(--red)">${escHtml(v)}</span>`).join('') || '—';
+      const tags  = (si.tags  || []).join(', ') || '—';
+      html += `<div class="tls-panel"><strong>Shodan InternetDB</strong><br>
+        Open ports: ${escHtml(ports)}<br>Tags: ${escHtml(tags)}<br>CVEs: ${vulns}</div>`;
+    } else if (si?.detail) {
+      html += `<div class="breakdown-note">Shodan: ${escHtml(si.detail)}</div>`;
+    }
+
+    if (sh && !sh.error) {
+      const org  = sh.org  || sh.isp || '—';
+      const os   = sh.os   || '—';
+      const country = sh.country_name || '—';
+      html += `<div class="tls-panel"><strong>Shodan Full</strong><br>
+        Org: ${escHtml(org)} · OS: ${escHtml(os)} · ${escHtml(country)}</div>`;
+    } else if (sh?.error && !sh.error.includes('401')) {
+      html += `<div class="breakdown-note">Shodan full: ${escHtml(sh.error)}</div>`;
+    }
+
+    if (ce && !ce.error) {
+      const services = (ce.services || []).slice(0, 4).map(s => escHtml(`${s.port}/${s.transport_protocol || 'tcp'}`)).join(', ') || '—';
+      html += `<div class="tls-panel"><strong>Censys</strong><br>
+        Services: ${services}</div>`;
+    }
+
+    panel.innerHTML = html || '<div class="breakdown-note">No threat-intel data. Add Shodan/Censys API keys in Settings to unlock full results.</div>';
+  });
+}
+
+// ── C4: Infrastructure tree / hierarchy view ──────────────────
+function renderTree(result, domain) {
+  if (!result) return;
+  const detected = Object.keys(PROVIDER_UI).filter(id => result.providers?.[id]?.verdict?.detected);
+
+  // Classify providers into semantic layers
+  const WAF_IDS   = ['imperva','sucuri','datadome','perimeterx','f5xc'];
+  const CDN_IDS   = ['cloudflare','google','akamai','fastly','cloudfront','azure','vercel',
+                     'netlify','bunnycdn','stackpath','keycdn','gcore','tencenteo','alicdn',
+                     'arvancloud','vncdn','flyio','render','railway'];
+  const layer = id => WAF_IDS.includes(id) ? 'WAF / Bot-Mgmt' : 'CDN / Edge';
+
+  const byLayer = {};
+  for (const id of detected) {
+    const l = layer(id);
+    (byLayer[l] = byLayer[l] || []).push(id);
+  }
+
+  const clientNode = `<div class="tree-node tree-client">🌐 Client</div>`;
+  const arrowDown  = `<div class="tree-arrow">↓</div>`;
+
+  let layersHtml = '';
+  for (const [lname, ids] of Object.entries(byLayer)) {
+    const chips = ids.map(id => {
+      const ui = PROVIDER_UI[id];
+      return `<span class="tree-chip" style="border-color:${escHtml(ui?.color || '#999')};color:${escHtml(ui?.color || '#999')}">${escHtml(ui?.name || id)}</span>`;
+    }).join('');
+    layersHtml += `
+      ${arrowDown}
+      <div class="tree-layer">
+        <div class="tree-layer-label">${escHtml(lname)}</div>
+        <div class="tree-chips">${chips}</div>
+      </div>`;
+  }
+
+  const extraMeta = [];
+  if (result.dnsProvider) extraMeta.push(`<span class="tree-chip meta-chip">🔑 ${escHtml(result.dnsProvider)}</span>`);
+  if (result.spfDmarc?.spfProvider) extraMeta.push(`<span class="tree-chip meta-chip">✉ ${escHtml(result.spfDmarc.spfProvider)}</span>`);
+
+  const metaRow = extraMeta.length ? `<div class="tree-meta-row">${extraMeta.join('')}</div>` : '';
+  const originNode = `${arrowDown}<div class="tree-node tree-origin">🏠 Origin (${escHtml(domain)})</div>`;
+
+  const content = !detected.length
+    ? '<div class="empty-state" style="padding:24px 0">No providers detected — nothing to visualize.</div>'
+    : `<div class="tree-view">${clientNode}${layersHtml}${originNode}${metaRow}</div>`;
+
+  resultsEl.innerHTML = `
+    <div class="detail-header">
+      <button class="back-btn" id="backBtn">← Back</button>
+      <span class="detail-name">🌲 Infrastructure Tree</span>
+    </div>
+    ${content}`;
+  document.getElementById('backBtn').addEventListener('click', () => {
+    if (resultsEl._scan) renderOverview(resultsEl._scan, resultsEl._cached, resultsEl._diff);
+  });
+}
+
+// Wire C4 tree button in overview toolbar
+// (treeBtn added via insertAdjacentHTML when overview renders)
+

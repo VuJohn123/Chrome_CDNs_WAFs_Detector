@@ -1,66 +1,95 @@
-function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+'use strict';
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 const state = { A: null, B: null };
 
-function scanOneDomain(domain, onProgress) {
+function scanOne(domain) {
   return new Promise(resolve => {
     let settled = false;
     const port = chrome.runtime.connect({ name: 'scan' });
-    const finish = (status, data) => { if (settled) return; settled = true; try { port.disconnect(); } catch {} resolve({ status, data }); };
+    const done = (status, data) => {
+      if (settled) return;
+      settled = true;
+      try { port.disconnect(); } catch {}
+      resolve({ status, data });
+    };
     port.onMessage.addListener(msg => {
-      if (msg.type === 'progress') onProgress?.(msg);
-      else if (msg.type === 'result') finish('done', msg.data);
-      else if (msg.type === 'error') finish('error', { message: msg.message });
+      if (msg.type === 'result') done('done', msg.data);
+      else if (msg.type === 'error') done('error', { message: msg.message });
     });
-    port.onDisconnect.addListener(() => finish('error', { message: 'disconnected' }));
+    port.onDisconnect.addListener(() => done('error', { message: 'Disconnected' }));
+    setTimeout(() => done('error', { message: 'Timeout' }), 60000);
     port.postMessage({ action: 'scan', domain, forceRefresh: false });
   });
 }
 
-function renderColResult(col, result) {
+function renderCol(col, result) {
   const el = document.getElementById(`result${col}`);
   const order = Object.keys(PROVIDER_META);
-  const detected = order.filter(id => result.providers?.[id]?.verdict?.detected);
-  el.innerHTML = detected.length
-    ? detected.map(id => `<div class="result-row hit"><span>${escHtml(PROVIDER_META[id].name)}</span><strong>${result.providers[id].verdict.score}%</strong></div>`).join('')
-    : '<div class="empty-state">No providers detected</div>';
+  const detected = order.filter(id => result.providers?.[id]?.verdict?.detected)
+    .sort((a, b) => (result.providers[b].verdict.score || 0) - (result.providers[a].verdict.score || 0));
+
+  if (!detected.length) {
+    el.innerHTML = '<div style="color:var(--text-faint);font-size:11.5px;padding:8px 0;font-style:italic">No providers detected</div>';
+    return;
+  }
+  el.innerHTML = detected.map(id => {
+    const pv = result.providers[id];
+    const color = PROVIDER_META[id]?.color || 'var(--accent)';
+    return `<div class="col-result-row hit" style="border-left:3px solid ${esc(color)}">
+      <span>${esc(PROVIDER_META[id]?.name || id)}</span>
+      <span class="pct">${pv.verdict.score}%</span>
+    </div>`;
+  }).join('');
 }
 
 function renderSummary() {
-  const sumEl = document.getElementById('compareSummary');
-  if (!state.A || !state.B) { sumEl.innerHTML = ''; return; }
+  const sum = document.getElementById('compareSummary');
+  if (!state.A || !state.B) { sum.hidden = true; return; }
+
   const order = Object.keys(PROVIDER_META);
-  const detA = new Set(order.filter(id => state.A.providers?.[id]?.verdict?.detected));
-  const detB = new Set(order.filter(id => state.B.providers?.[id]?.verdict?.detected));
-  const onlyA  = [...detA].filter(id => !detB.has(id));
-  const onlyB  = [...detB].filter(id => !detA.has(id));
-  const shared = [...detA].filter(id => detB.has(id));
-  const nameOf = id => PROVIDER_META[id]?.name || id;
-  sumEl.innerHTML = `
-    ${sectionRow('Used by both', shared.map(nameOf))}
-    ${sectionRow('Only domain A', onlyA.map(nameOf))}
-    ${sectionRow('Only domain B', onlyB.map(nameOf))}`;
-}
-function sectionRow(title, items) {
-  return `<div style="margin-bottom:10px"><div class="section-header">${escHtml(title)}</div>
-    <div style="font-size:12px;color:var(--text-dim);padding:6px 0">${items.length ? escHtml(items.join(', ')) : '—'}</div></div>`;
+  const dA = new Set(order.filter(id => state.A.providers?.[id]?.verdict?.detected));
+  const dB = new Set(order.filter(id => state.B.providers?.[id]?.verdict?.detected));
+  const shared = order.filter(id => dA.has(id) && dB.has(id));
+  const onlyA  = order.filter(id => dA.has(id) && !dB.has(id));
+  const onlyB  = order.filter(id => !dA.has(id) && dB.has(id));
+  const name = id => esc(PROVIDER_META[id]?.name || id);
+
+  const chips = (ids, cls) => ids.length
+    ? ids.map(id => `<span class="summary-chip ${cls}">${name(id)}</span>`).join('')
+    : '<span class="summary-empty">—</span>';
+
+  document.getElementById('chipsShared').innerHTML = chips(shared, 'shared');
+  document.getElementById('chipsOnlyA').innerHTML  = chips(onlyA, 'only-a');
+  document.getElementById('chipsOnlyB').innerHTML  = chips(onlyB, 'only-b');
+  sum.hidden = false;
 }
 
 document.querySelectorAll('.scan-col-btn').forEach(btn => {
   btn.addEventListener('click', async () => {
     const col = btn.dataset.col;
-    const domain = document.getElementById(`domain${col}`).value.trim().toLowerCase();
-    if (!domain) return;
+    const input = document.getElementById(`domain${col}`);
+    const domain = input.value.trim().toLowerCase().replace(/^https?:\/\//, '').split('/')[0];
+    if (!domain) { input.focus(); return; }
+
     const resultEl = document.getElementById(`result${col}`);
     btn.disabled = true;
-    resultEl.innerHTML = '<div class="empty-state">Scanning…</div>';
-    const { status, data } = await scanOneDomain(domain, msg => {
-      resultEl.innerHTML = `<div class="empty-state">${msg.pct}% — ${escHtml(msg.activity || '')}</div>`;
-    });
+    btn.textContent = `Scanning ${col}…`;
+    resultEl.innerHTML = '<div style="color:var(--text-faint);font-size:11.5px;padding:8px 0">Scanning…</div>';
+    state[col] = null;
+    document.getElementById('compareSummary').hidden = true;
+
+    const { status, data } = await scanOne(domain);
     btn.disabled = false;
-    if (status === 'error') { resultEl.innerHTML = `<div class="empty-state">Failed: ${escHtml(data?.message || 'error')}</div>`; return; }
+    btn.textContent = `Scan ${col}`;
+
+    if (status === 'error') {
+      resultEl.innerHTML = `<div style="color:var(--red);font-size:11.5px;padding:8px 0">Failed: ${esc(data?.message || 'error')}</div>`;
+      return;
+    }
     state[col] = data;
-    renderColResult(col, data);
+    renderCol(col, data);
     renderSummary();
   });
 });

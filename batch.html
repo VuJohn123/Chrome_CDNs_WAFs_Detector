@@ -5,30 +5,52 @@
 <title>Batch Scan — CDN/WAF Detector</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="fullpage.css">
 </head>
-<body class="full-page">
+<body>
 <div class="app">
   <header class="app-header">
-    <div class="header-left"><h1>Batch Scan</h1></div>
-    <div class="header-right"><span class="version-tag">v9.0</span></div>
+    <div class="header-left"><h1>⊞ Batch Scan</h1></div>
+    <div class="header-right">
+      <span id="progressText" class="breakdown-note"></span>
+      <span class="version-tag">v9.1</span>
+    </div>
   </header>
 
-  <section class="page-section">
-    <p class="breakdown-note" style="margin-bottom:8px">One domain (or IP) per line. Scans run with limited concurrency to avoid hammering any single resolver/CDN.</p>
-    <textarea id="domainList" class="batch-textarea" placeholder="example.com&#10;another-site.com&#10;1.2.3.4"></textarea>
-    <div class="batch-toolbar">
-      <input type="file" id="csvUpload" accept=".csv,.txt" style="font-size:11px;color:var(--text-dim)">
-      <button id="runBtn" style="background:var(--accent);color:#04141c;font-weight:700;padding:8px 16px;">Scan all</button>
-      <span id="batchProgressText" class="breakdown-note"></span>
+  <div class="fullpage-body">
+    <p class="fp-title">One domain (or IP) per line. Scans run 3 at a time to avoid overloading resolvers.</p>
+
+    <textarea id="domainList" class="batch-textarea" placeholder="example.com&#10;cloudflare.com&#10;fastly.com&#10;1.2.3.4"></textarea>
+
+    <div class="fp-toolbar">
+      <button id="runBtn" class="btn-action primary">▶ Scan all</button>
+      <label class="file-label">
+        📄 Upload .csv / .txt
+        <input type="file" id="csvUpload" accept=".csv,.txt">
+      </label>
+      <button id="clearBtn" class="btn-action">✕ Clear</button>
       <span style="flex:1"></span>
-      <button id="exportAllJson" class="link-btn">⇩ JSON</button>
-      <button id="exportAllCsv" class="link-btn">⇩ CSV</button>
+      <button id="exportJsonBtn" class="btn-action" disabled>⇩ JSON</button>
+      <button id="exportCsvBtn" class="btn-action" disabled>⇩ CSV</button>
     </div>
+
+    <div id="progressWrap" class="progress-wrap" hidden>
+      <div id="progressBar" class="progress-bar" style="width:0%"></div>
+    </div>
+
     <table class="batch-table" id="batchTable" hidden>
-      <thead><tr><th>Domain</th><th>Status</th><th>Detected providers</th><th>IPs</th></tr></thead>
+      <thead>
+        <tr>
+          <th style="width:26%">Domain</th>
+          <th style="width:9%">Status</th>
+          <th>Detected providers</th>
+          <th style="width:22%">Resolved IPs</th>
+          <th style="width:8%">Score</th>
+        </tr>
+      </thead>
       <tbody id="batchTbody"></tbody>
     </table>
-  </section>
+  </div>
 </div>
 <script src="provider-meta.js"></script>
 <script src="batch.js"></script>

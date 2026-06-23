@@ -760,7 +760,7 @@ async function performScan(domain, progress) {
         allSig[p.id][p.ipConfig.ipSignal] = true;
     }
   } else {
-  progress({ pct: 5, activity: 'DNS lookup (A/AAAA/CNAME/MX/NS/TXT)…' });
+  progress({ pct: 5, activity: 'DNS lookup (A/AAAA/CNAME/MX/NS/TXT/HTTPS)…' });
 
   await Promise.allSettled([
 
@@ -819,6 +819,36 @@ async function performScan(domain, progress) {
       // Store nsRecords on the first provider's bag so Phase 5 can read them
       // for DNS-provider identification without a second lookup.
       if (providers[0]) allSig[providers[0].id].nsRecords = nsRecords;
+    }),
+
+    // A1: HTTPS DNS record — ECH key, ALPN, IP hints (RFC 9460)
+    probeHttpsRecord(domain).then(hr => {
+      if (hr) {
+        // ECH present → strong Cloudflare signal (they pioneered ECH deployment)
+        if (hr.ech && allSig['cloudflare']) allSig['cloudflare'].echPresent = true;
+        // h3/h2 ALPN hints corroborate HTTP/3-capable providers
+        if (hr.alpn.includes('h3')) {
+          for (const id of ['cloudflare','google','fastly','cloudfront'])
+            if (allSig[id]) allSig[id].quicH3Hint = true;
+        }
+        // Store on first provider's bag for result export
+        if (providers[0]) allSig[providers[0].id]._httpsRecord = hr;
+      }
+    }),
+
+    // A4: SPF + DMARC — email infra fingerprint
+    probeSPFandDMARC(domain).then(sd => {
+      if (providers[0]) allSig[providers[0].id]._spfDmarc = sd;
+    }),
+
+    // A5: Anycast divergence — query 3 resolvers, flag if IPs differ
+    anyCastMap(domain).then(ac => {
+      if (providers[0]) allSig[providers[0].id]._anycast = ac;
+      // If IPs diverge across resolvers, it's a strong anycast (CDN) indicator
+      if (ac.diverges) {
+        for (const p of providers)
+          if ('dnsShortTtl' in allSig[p.id]) allSig[p.id].anycastDivergence = true;
+      }
     }),
 
     // Cookie scan
@@ -1006,6 +1036,12 @@ async function performScan(domain, progress) {
   // ── A1: layer-order inference, using the now-known detected set ───
   const layerChain = inferLayerChain(allSig[providers[0]?.id]?.viaHeader, detectedIds, id => id);
 
+  // Pull out enrichment data stashed on the first provider's signal bag
+  const _firstSig  = allSig[providers[0]?.id] || {};
+  const httpsRecord = _firstSig._httpsRecord || null;
+  const spfDmarc    = _firstSig._spfDmarc    || null;
+  const anycast     = _firstSig._anycast      || null;
+
   return {
     providers: results,
     customProviders: customResults,
@@ -1016,6 +1052,9 @@ async function performScan(domain, progress) {
     dnsProvider,
     tlsIntel,
     migrationWarning,
+    httpsRecord,   // A1 — ECH, ALPN, IPv4 hints from HTTPS RR
+    spfDmarc,      // A4 — email infra (SPF provider + DMARC policy)
+    anycast,       // A5 — multi-resolver IP divergence map
     scannedAt: new Date().toISOString()
   };
 }
@@ -1063,7 +1102,9 @@ async function fetchProviderCves(providerName) {
 const SETTINGS_KEY = 'app_settings';
 const DEFAULT_SETTINGS = {
   theme: 'system', crowdReportEnabled: false, crowdReportEndpoint: '',
-  watchlistIntervalMin: 360, ambientModeEnabled: false
+  watchlistIntervalMin: 360, ambientModeEnabled: false,
+  // D3: optional third-party threat-intel API keys (stored locally, never transmitted except to their respective APIs)
+  shodanApiKey: '', censysApiId: '', censysApiSecret: '',
 };
 async function getSettings() {
   try {
@@ -1326,6 +1367,104 @@ try {
   }
 } catch { /* not Firefox — silently inert */ }
 
+// ════════════════════════════════════════════════════════════════
+// Round-3 additions: C1, A1, A2/A3, A4, A5
+// ════════════════════════════════════════════════════════════════
+
+// ── C1: Service-worker keep-alive heartbeat ───────────────────
+// MV3 service workers are killed after ~30 s of inactivity.
+// A periodic alarm every ~20 s reactivates the SW before Chrome
+// terminates it, so long batch/watchlist scans don't silently abort.
+const KEEPALIVE_ALARM = 'cdnwaf-keepalive';
+chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.33 });
+
+// ── A5: Multi-resolver anycast mapping ───────────────────────
+const ANYCAST_RESOLVERS = [
+  { name: 'Cloudflare', url: 'https://cloudflare-dns.com/dns-query' },
+  { name: 'Google',     url: 'https://dns.google/dns-query' },
+  { name: 'Quad9',      url: 'https://dns.quad9.net/dns-query' },
+];
+async function dohAlt(resolverUrl, domain) {
+  try {
+    const res = await fetchT(
+      `${resolverUrl}?name=${encodeURIComponent(domain)}&type=A`,
+      { headers: { Accept: 'application/dns-json' } }, 5000
+    );
+    if (!res.ok) return [];
+    const j = await res.json();
+    return (j.Answer || []).filter(r => r.type === 1).map(r => r.data.trim());
+  } catch { return []; }
+}
+async function anyCastMap(domain) {
+  const rows = await Promise.allSettled(
+    ANYCAST_RESOLVERS.map(r => dohAlt(r.url, domain).then(ips => ({ resolver: r.name, ips })))
+  );
+  const entries = rows.filter(r => r.status === 'fulfilled').map(r => r.value);
+  const allIps  = [...new Set(entries.flatMap(e => e.ips))];
+  const diverges = allIps.length > 1 && entries.some(e =>
+    JSON.stringify([...e.ips].sort()) !== JSON.stringify([...entries[0].ips].sort())
+  );
+  return { entries, diverges, uniqueIps: allIps };
+}
+
+// ── A1: HTTPS DNS record (RFC 9460) ──────────────────────────
+// HTTPS RR carries ECH public keys (→ Cloudflare signal), ALPN (h3/h2),
+// and IP hints — all verifiable via DoH, zero TLS handshake needed.
+async function probeHttpsRecord(domain) {
+  try {
+    const res = await fetchT(
+      `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=HTTPS`,
+      { headers: { Accept: 'application/dns-json' } }, 6000
+    );
+    if (!res.ok) return null;
+    const j = await res.json();
+    const answers = (j.Answer || []).filter(r => r.type === 65);
+    if (!answers.length) return null;
+    const raw = answers.map(a => a.data).join(' ');
+    const echPresent = /\bech=/.test(raw);
+    const alpnMatch  = raw.match(/alpn="([^"]+)"/);
+    const alpn       = alpnMatch ? alpnMatch[1].split(',').map(s => s.trim()) : [];
+    const ip4Match   = raw.match(/ipv4hint="([^"]+)"/);
+    const ipv4hints  = ip4Match ? ip4Match[1].split(',').map(s => s.trim()) : [];
+    return { ech: echPresent, alpn, ipv4hints, raw };
+  } catch { return null; }
+}
+
+// ── A4: SPF + DMARC fingerprint ──────────────────────────────
+const SPF_PROVIDERS = [
+  { re: /include:_spf\.google\.com/,           name: 'Google Workspace' },
+  { re: /include:spf\.protection\.outlook/,    name: 'Microsoft 365' },
+  { re: /include:.*mimecast/,                  name: 'Mimecast' },
+  { re: /include:.*proofpoint/,                name: 'Proofpoint' },
+  { re: /include:.*sendgrid/,                  name: 'SendGrid' },
+  { re: /include:.*mailchimp/,                 name: 'Mailchimp' },
+  { re: /include:.*amazonses\.com/,            name: 'Amazon SES' },
+  { re: /include:.*zoho/,                      name: 'Zoho Mail' },
+  { re: /include:.*mailgun/,                   name: 'Mailgun' },
+];
+async function probeSPFandDMARC(domain) {
+  const out = { spfProvider: null, dmarcPolicy: null, spfRaw: null };
+  try {
+    const [spf, dmarc] = await Promise.allSettled([
+      doh(domain, 'TXT'), doh(`_dmarc.${domain}`, 'TXT')
+    ]);
+    const spfRec = (spf.value?.Answer || [])
+      .map(r => r.data).find(d => /v=spf1/i.test(d));
+    if (spfRec) {
+      out.spfRaw = spfRec;
+      for (const { re, name } of SPF_PROVIDERS)
+        if (re.test(spfRec)) { out.spfProvider = name; break; }
+    }
+    const dmarcRec = (dmarc.value?.Answer || [])
+      .map(r => r.data).find(d => /v=DMARC1/i.test(d));
+    if (dmarcRec) {
+      const pm = dmarcRec.match(/\bp=(\w+)/i);
+      out.dmarcPolicy = pm ? pm[1] : 'present';
+    }
+  } catch {}
+  return out;
+}
+
 // Assign now that loadCachedRanges() is defined. Any scan triggered before
 // this resolves will correctly await it — no race condition possible because
 // the first scan can only be triggered by a user action, which comes after
@@ -1356,6 +1495,7 @@ chrome.runtime.onConnect.addListener(port => {
       const diff = await diffAgainstHistory(domain, result); // before history is overwritten
       await setCached(domain, result);
       await addToHistory(domain, result);
+      await saveSnapshot(domain, result); // D1: full snapshot for timeline diff
       await updateBadge(result);
       // Record for multi-tab correlation
       const tabId = port.sender?.tab?.id;
@@ -1376,6 +1516,7 @@ chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
       const diff = await diffAgainstHistory(msg.domain, r);
       await setCached(msg.domain, r);
       await addToHistory(msg.domain, r);
+      await saveSnapshot(msg.domain, r); // D1
       await updateBadge(r);
       const tabCorrelation = getTabCorrelation(msg.domain);
       return { ...r, tabCorrelation, diff };
@@ -1420,6 +1561,12 @@ chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
   }
   if (msg.action === 'setSettings') {
     setSettings(msg.patch || {}).then(s => sendResponse(s));
+    return true;
+  }
+  if (msg.action === 'warmCache') {
+    // B2: offscreen document asks SW to warm IP ranges on startup
+    rangesReady = loadCachedRanges().catch(() => {});
+    sendResponse({ ok: true });
     return true;
   }
   if (msg.action === 'submitCrowdReport') {
@@ -1476,10 +1623,34 @@ chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
     injectAndGetTimingData(msg.tabId).then(data => sendResponse({ data }));
     return true;
   }
+  // D1: Full snapshot for infrastructure-diff timeline
+  if (msg.action === 'getSnapshotHistory') {
+    getSnapshotHistory(msg.domain).then(list => sendResponse({ snapshots: list }));
+    return true;
+  }
+  // D3: Shodan/Censys lookup (user-supplied key)
+  if (msg.action === 'queryThreatIntel') {
+    queryThreatIntel(msg.ip, msg.provider).then(r => sendResponse(r))
+      .catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+  // Clipboard scan: background receives domain from popup clipboard button
+  if (msg.action === 'scanClipboardDomain') {
+    (async () => {
+      const r = await performScan(msg.domain, () => {});
+      const diff = await diffAgainstHistory(msg.domain, r);
+      await setCached(msg.domain, r);
+      await addToHistory(msg.domain, r);
+      await updateBadge(r);
+      return { ...r, diff };
+    })().then(r => sendResponse(r)).catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
 });
 
 // ── A4 improvement: scheduled watchlist re-scans ──────────────
 chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === KEEPALIVE_ALARM) return; // no-op — just reactivates SW
   if (alarm.name === WATCHLIST_ALARM) runWatchlistCheck();
 });
 ensureWatchlistAlarm();
@@ -1512,11 +1683,51 @@ chrome.contextMenus.onClicked.addListener(async (info) => {
   } catch {}
 });
 
-// ── B4: Local "webhook" — lets OTHER pages you explicitly trust call this
-// extension directly via chrome.runtime.sendMessage(EXTENSION_ID, ...).
-// Disabled by default: manifest.json's externally_connectable.matches is
-// an empty array, so no page can reach this listener until you add your
-// own trusted origin(s) there (e.g. "https://your-internal-tool/*").
+// ── C3: Keyboard commands ─────────────────────────────────────
+chrome.commands.onCommand.addListener(async (command) => {
+  if (command === 'open-side-panel') {
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab?.windowId != null) await chrome.sidePanel.open({ windowId: tab.windowId });
+    } catch {}
+  }
+  if (command === 'scan-clipboard') {
+    // B3: Read clipboard, detect domain/IP, trigger scan and open popup
+    // Note: clipboard access in SW requires a focused document — we store a
+    // flag and let the popup/sidepanel read it on next open instead.
+    await chrome.storage.local.set({ clipboard_scan_pending: true });
+    try { if (chrome.action.openPopup) await chrome.action.openPopup(); } catch {}
+  }
+});
+
+// ── B2: Offscreen document for cache warming ──────────────────
+// Chrome 116+: offscreen documents can keep a hidden DOM-backed page alive
+// so that IP-range JSON can be fetched + cached without waiting for the SW
+// to wake from cold. Gracefully absent on older Chrome or Firefox.
+async function ensureOffscreenDocument() {
+  if (!chrome.offscreen) return; // Chrome <116 or Firefox — skip
+  try {
+    const existing = await chrome.offscreen.hasDocument().catch(() => false);
+    if (!existing) {
+      await chrome.offscreen.createDocument({
+        url: chrome.runtime.getURL('offscreen.html'),
+        reasons: ['BLOBS'],
+        justification: 'Warm IP-range cache on extension startup to eliminate cold-start scan delay'
+      });
+    }
+  } catch {} // non-fatal if offscreen not available
+}
+ensureOffscreenDocument();
+
+// ── B5: API mode docs anchor ──────────────────────────────────
+// The onMessageExternal listener below accepts scan requests from pages
+// listed in manifest.json > externally_connectable > matches.
+// Default: empty array → nothing can connect. To enable:
+//   1. Add your origin to manifest.json externally_connectable.matches
+//   2. From your page: chrome.runtime.sendMessage(EXT_ID, {action:'scan',domain:'...'})
+//   3. Response is the full performScan result JSON
+
+// ── B4: Local "webhook" ───────────────────────────────────────
 chrome.runtime.onMessageExternal.addListener((msg, _sender, sendResponse) => {
   if (msg?.action === 'scan' && msg.domain) {
     performScan(msg.domain, () => {})
@@ -1526,6 +1737,78 @@ chrome.runtime.onMessageExternal.addListener((msg, _sender, sendResponse) => {
   }
   sendResponse({ error: 'Unsupported action' });
 });
+
+
+// ════════════════════════════════════════════════════════════════
+// D1: Full infrastructure snapshot — diff timeline
+// Unlike addToHistory() which only stores detected[] provider IDs,
+// snapshots store the FULL result object so callers can diff individual
+// signals, scores, and HTTPS/anycast/SPF intel across time.
+// ════════════════════════════════════════════════════════════════
+const SNAPSHOT_KEY_PREFIX = 'snap_';
+const MAX_SNAPSHOTS_PER_DOMAIN = 30;
+
+async function saveSnapshot(domain, result) {
+  const key = SNAPSHOT_KEY_PREFIX + domain;
+  try {
+    const { [key]: existing = [] } = await chrome.storage.local.get(key);
+    existing.unshift({ ts: Date.now(), result });
+    await chrome.storage.local.set({ [key]: existing.slice(0, MAX_SNAPSHOTS_PER_DOMAIN) });
+  } catch {}
+}
+async function getSnapshotHistory(domain) {
+  const key = SNAPSHOT_KEY_PREFIX + domain;
+  try {
+    const { [key]: list = [] } = await chrome.storage.local.get(key);
+    return list;
+  } catch { return []; }
+}
+
+// ════════════════════════════════════════════════════════════════
+// D3: Threat intel — optional Shodan / Censys lookups
+// Users bring their own API keys (stored in settings, never sent
+// anywhere except the respective vendor's API). Both APIs are CORS-
+// permissive from browser context, so fetch() works directly.
+// ════════════════════════════════════════════════════════════════
+async function queryThreatIntel(ip, provider) {
+  const settings = await getSettings();
+  const results  = {};
+
+  // Shodan InternetDB (free, no key, CORS-open) — basic port/vuln info
+  try {
+    const res = await fetchT(`https://internetdb.shodan.io/${encodeURIComponent(ip)}`, {}, 8000);
+    if (res.ok) results.shodanInternetDb = await res.json();
+    else results.shodanInternetDb = null;
+  } catch { results.shodanInternetDb = null; }
+
+  // Shodan full API — requires user key
+  if (settings.shodanApiKey) {
+    try {
+      const res = await fetchT(
+        `https://api.shodan.io/shodan/host/${encodeURIComponent(ip)}?key=${encodeURIComponent(settings.shodanApiKey)}`,
+        {}, 10000
+      );
+      results.shodan = res.ok ? await res.json() : { error: `HTTP ${res.status}` };
+    } catch (e) { results.shodan = { error: e.message }; }
+  }
+
+  // Censys hosts API — requires API ID + secret
+  if (settings.censysApiId && settings.censysApiSecret) {
+    try {
+      const auth = btoa(`${settings.censysApiId}:${settings.censysApiSecret}`);
+      const res  = await fetchT(
+        `https://search.censys.io/api/v2/hosts/${encodeURIComponent(ip)}`,
+        { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } }, 10000
+      );
+      results.censys = res.ok ? (await res.json())?.result : { error: `HTTP ${res.status}` };
+    } catch (e) { results.censys = { error: e.message }; }
+  }
+
+  return results;
+}
+
+// Wire snapshot saving into the port and onMessage scan handlers
+// (done below by patching: after addToHistory, also call saveSnapshot)
 
 // ── #18: Multi-tab correlation ─────────────────────────────────
 // Accumulates scan results for the same apex domain across different tabs

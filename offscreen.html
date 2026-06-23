@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<!-- offscreen.html: loaded as a Chrome offscreen document (Chrome 116+)
+     to warm the IP-range cache on extension startup, eliminating the
+     cold-start delay on the first scan after the service worker wakes up. -->
+<html><head><meta charset="UTF-8"></head>
+<body>
+<script>
+// Signal the background SW to pre-fetch/warm ranges
+// (the SW handles the actual fetch via its own loadCachedRanges logic;
+//  this document just keeps the extension "awake" during startup)
+chrome.runtime.sendMessage({ action: 'warmCache' }).catch(() => {});
+</script>
+</body></html>

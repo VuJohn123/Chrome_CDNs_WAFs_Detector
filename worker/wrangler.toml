@@ -1,0 +1,7 @@
+name = "cdnwaf-crowd-signatures"
+main = "crowd-signatures-worker.js"
+compatibility_date = "2026-01-01"
+
+kv_namespaces = [
+  { binding = "REPORTS", id = "9b2a1f3a2bbe4eb986c56c591e62de17" }
+]
