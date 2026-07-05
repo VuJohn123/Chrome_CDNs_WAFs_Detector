@@ -1471,6 +1471,131 @@ async function probeSPFandDMARC(domain) {
 // the full script has been evaluated.
 rangesReady = loadCachedRanges().catch(() => {});
 
+// ════════════════════════════════════════════════════════════════
+// Distributed probing via check-host.net public API
+// Runs HTTP checks from real servers in ~50 countries, returns response
+// headers + resolved IP + latency per node — reveals anycast routing
+// and lets us see CDN edge headers from multiple geographic vantage points.
+// Public, free, no auth. Capped to be a good API citizen.
+// Docs: https://check-host.net/about/api
+// ════════════════════════════════════════════════════════════════
+const CHECK_HOST_MAX_NODES = 12;
+const CHECK_HOST_POLL_INTERVAL_MS = 2000;
+const CHECK_HOST_MAX_POLLS = 5;
+
+const PROBE_HEADER_PATTERNS = [
+  { name: 'cloudflare',  re: /\bcf-ray\b/i },
+  { name: 'cloudflare',  re: /server:\s*cloudflare\b/i },
+  { name: 'akamai',      re: /\bx-check-cacheable\b/i },
+  { name: 'akamai',      re: /\bakamai-cache-status\b/i },
+  { name: 'fastly',      re: /x-served-by.*cache/i },
+  { name: 'fastly',      re: /\bfastly-/i },
+  { name: 'cloudfront',  re: /\bx-amz-cf-id\b/i },
+  { name: 'azure',       re: /\bx-azure-ref\b/i },
+  { name: 'google',      re: /via:.*google\b/i },
+  { name: 'vercel',      re: /\bx-vercel-id\b/i },
+  { name: 'netlify',     re: /\bx-nf-request-id\b/i },
+  { name: 'imperva',     re: /\bx-iinfo\b/i },
+  { name: 'bunnycdn',    re: /\bbunnycdn-cache\b/i },
+];
+function extractCdnFromHeaders(headersStr) {
+  const detected = new Set();
+  for (const { name, re } of PROBE_HEADER_PATTERNS) if (re.test(headersStr)) detected.add(name);
+  return [...detected];
+}
+function parseProbeHeaders(headersStr) {
+  const lines = (headersStr || '').split(/\r?\n/);
+  const obj = {};
+  for (const line of lines.slice(1)) {
+    const colon = line.indexOf(':');
+    if (colon > 0) {
+      const key = line.slice(0, colon).trim().toLowerCase();
+      const val = line.slice(colon + 1).trim();
+      if (!obj[key]) obj[key] = val;
+    }
+  }
+  return obj;
+}
+async function probeDistributed(domain) {
+  let token, nodes;
+  try {
+    const init = await fetchT(
+      `https://check-host.net/check-http?host=${encodeURIComponent(domain)}&max_nodes=${CHECK_HOST_MAX_NODES}`,
+      { headers: { Accept: 'application/json' } }, 10000
+    );
+    if (!init.ok) return { error: `check-host.net returned ${init.status}` };
+    const j = await init.json();
+    token = j.request_token;
+    nodes = j.nodes || {};
+  } catch (e) { return { error: e.message || 'Failed to reach check-host.net' }; }
+  if (!token) return { error: 'No request token in response' };
+
+  let resultData = {};
+  for (let poll = 0; poll < CHECK_HOST_MAX_POLLS; poll++) {
+    await new Promise(r => setTimeout(r, CHECK_HOST_POLL_INTERVAL_MS));
+    try {
+      const res = await fetchT(`https://check-host.net/check-result/${token}`, { headers: { Accept: 'application/json' } }, 8000);
+      if (!res.ok) continue;
+      resultData = await res.json();
+      const pending = Object.values(resultData).filter(v => v === null).length;
+      if (pending === 0) break;
+    } catch {}
+  }
+
+  const nodeResults = [];
+  for (const [nodeId, result] of Object.entries(resultData)) {
+    const nodeInfo = nodes[nodeId];
+    if (!nodeInfo) continue;
+    const [, countryCode, city, countryName] = nodeInfo;
+    if (!result || !result[0]) {
+      nodeResults.push({ nodeId, country: countryName || countryCode, city, status: 'pending' });
+      continue;
+    }
+    const [connectCode, , httpCode, headersStr, latency] = result[0];
+    const parsedHeaders = parseProbeHeaders(headersStr || '');
+    nodeResults.push({
+      nodeId, country: countryName || countryCode, city,
+      status: connectCode === 1 ? 'ok' : 'fail',
+      httpCode, latencyMs: latency ? Math.round(latency * 1000) : null,
+      cdnSignals: extractCdnFromHeaders(headersStr || ''),
+      resolvedIp: parsedHeaders['x-real-ip'] || null,
+      serverHeader: parsedHeaders['server'] || null,
+      cacheHeader: parsedHeaders['cf-cache-status'] || parsedHeaders['x-cache'] || null,
+    });
+  }
+
+  const uniqueIps = [...new Set(nodeResults.filter(r => r.resolvedIp).map(r => r.resolvedIp))];
+  return {
+    domain, nodeResults,
+    uniqueEdgeIps: uniqueIps,
+    anycastConfirmed: uniqueIps.length > 1,
+    cdnSignalsSeen: [...new Set(nodeResults.flatMap(r => r.cdnSignals || []))],
+    totalNodes: nodeResults.length,
+    okNodes: nodeResults.filter(r => r.status === 'ok').length,
+  };
+}
+
+// ════════════════════════════════════════════════════════════════
+// ASN / org lookup via ipinfo.io (free tier)
+// ════════════════════════════════════════════════════════════════
+const asnCache = new Map();
+async function queryASN(ip) {
+  if (asnCache.has(ip)) return asnCache.get(ip);
+  try {
+    const res = await fetchT(`https://ipinfo.io/${encodeURIComponent(ip)}/json`, {}, 6000);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const result = {
+      asn: data.org?.split(' ')[0] || null,
+      org: data.org?.slice(data.org.indexOf(' ') + 1) || null,
+      country: data.country || null,
+      city: data.city || null,
+    };
+    asnCache.set(ip, result);
+    return result;
+  } catch { return null; }
+}
+
 // ── Port listener (progress streaming) ───────────────────────
 chrome.runtime.onConnect.addListener(port => {
   if (port.name !== 'scan') return;
@@ -1632,6 +1757,17 @@ chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
   if (msg.action === 'queryThreatIntel') {
     queryThreatIntel(msg.ip, msg.provider).then(r => sendResponse(r))
       .catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+  // Distributed probing (check-host.net) — 12 global vantage points
+  if (msg.action === 'probeDistributed') {
+    probeDistributed(msg.domain).then(r => sendResponse(r))
+      .catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+  // ASN/org lookup for a specific IP
+  if (msg.action === 'queryASN') {
+    queryASN(msg.ip).then(r => sendResponse({ data: r }));
     return true;
   }
   // Clipboard scan: background receives domain from popup clipboard button

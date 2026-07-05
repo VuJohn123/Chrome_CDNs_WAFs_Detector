@@ -1973,60 +1973,168 @@ function renderThreatIntel(ip) {
 // ── C4: Infrastructure tree / hierarchy view ──────────────────
 function renderTree(result, domain) {
   if (!result) return;
-  const detected = Object.keys(PROVIDER_UI).filter(id => result.providers?.[id]?.verdict?.detected);
 
-  // Classify providers into semantic layers
-  const WAF_IDS   = ['imperva','sucuri','datadome','perimeterx','f5xc'];
-  const CDN_IDS   = ['cloudflare','google','akamai','fastly','cloudfront','azure','vercel',
-                     'netlify','bunnycdn','stackpath','keycdn','gcore','tencenteo','alicdn',
-                     'arvancloud','vncdn','flyio','render','railway'];
-  const layer = id => WAF_IDS.includes(id) ? 'WAF / Bot-Mgmt' : 'CDN / Edge';
+  // ── 4-layer taxonomy ─────────────────────────────────────────
+  // Order follows observed traffic flow: WAF/Bot → CDN/Delivery → Edge-hosting.
+  // Within a layer, use Via-header chain order when available; otherwise
+  // sort by confidence score so the strongest signal leads.
+  const TAXONOMY = [
+    {
+      id: 'waf', label: 'WAF / Bot Protection', icon: '🛡', color: '#f0555a',
+      ids: ['imperva','sucuri','datadome','perimeterx','f5xc'],
+      tip: 'Filters malicious traffic before it reaches the CDN or origin'
+    },
+    {
+      id: 'cdn', label: 'CDN / Global Delivery', icon: '🌐', color: '#1ed4ff',
+      ids: ['cloudflare','google','akamai','fastly','cloudfront','azure',
+            'bunnycdn','stackpath','keycdn','gcore','tencenteo','alicdn','arvancloud','vncdn'],
+      tip: 'Caches and delivers content from edge PoPs near end-users'
+    },
+    {
+      id: 'hosting', label: 'Edge Hosting / Serverless', icon: '⚡', color: '#8b5cf6',
+      ids: ['vercel','netlify','flyio','render','railway'],
+      tip: 'Application hosting with built-in edge delivery; often the origin itself'
+    },
+  ];
 
-  const byLayer = {};
-  for (const id of detected) {
-    const l = layer(id);
-    (byLayer[l] = byLayer[l] || []).push(id);
+  const detectedMap = {};
+  for (const id of Object.keys(PROVIDER_UI)) {
+    const pv = result.providers?.[id];
+    if (pv?.verdict?.detected) detectedMap[id] = pv.verdict.score;
   }
 
-  const clientNode = `<div class="tree-node tree-client">🌐 Client</div>`;
-  const arrowDown  = `<div class="tree-arrow">↓</div>`;
+  const chainOrder = result.layerChain?.chain || [];
+  const sortByChain = ids => {
+    const inChain  = ids.filter(id => chainOrder.includes(id))
+      .sort((a,b) => chainOrder.indexOf(a) - chainOrder.indexOf(b));
+    const notChain = ids.filter(id => !chainOrder.includes(id))
+      .sort((a,b) => (detectedMap[b]||0) - (detectedMap[a]||0));
+    return [...inChain, ...notChain];
+  };
 
-  let layersHtml = '';
-  for (const [lname, ids] of Object.entries(byLayer)) {
-    const chips = ids.map(id => {
-      const ui = PROVIDER_UI[id];
-      return `<span class="tree-chip" style="border-color:${escHtml(ui?.color || '#999')};color:${escHtml(ui?.color || '#999')}">${escHtml(ui?.name || id)}</span>`;
-    }).join('');
+  const chip = (id, layerColor) => {
+    const ui      = PROVIDER_UI[id];
+    const score   = detectedMap[id] ?? 0;
+    const color   = ui?.color || layerColor;
+    const inChain = chainOrder.includes(id);
+    return `<span class="tree-chip${inChain ? ' chain-confirmed' : ''}"
+      style="border-color:${escHtml(color)};color:${escHtml(color)}"
+      title="${escHtml(ui?.name || id)} — ${score}% confidence${inChain ? ' (confirmed by Via header)' : ''}">
+      ${escHtml(ui?.name || id)} <span class="tree-chip-score">${score}%</span>
+    </span>`;
+  };
+
+  const arrowDown  = `<div class="tree-arrow">↓</div>`;
+  const clientNode = `<div class="tree-node tree-client">🌐 Visitor</div>`;
+
+  let layersHtml = '', detectedCount = 0;
+  for (const layer of TAXONOMY) {
+    const presentIds = sortByChain(layer.ids.filter(id => detectedMap[id] !== undefined));
+    if (!presentIds.length) continue;
+    detectedCount += presentIds.length;
     layersHtml += `
       ${arrowDown}
-      <div class="tree-layer">
-        <div class="tree-layer-label">${escHtml(lname)}</div>
-        <div class="tree-chips">${chips}</div>
+      <div class="tree-layer" style="--layer-color:${layer.color}">
+        <div class="tree-layer-label">${layer.icon} ${escHtml(layer.label)}</div>
+        <div class="tree-chips">${presentIds.map(id => chip(id, layer.color)).join('')}</div>
+        <div class="tree-layer-tip">${escHtml(layer.tip)}</div>
       </div>`;
   }
 
-  const extraMeta = [];
-  if (result.dnsProvider) extraMeta.push(`<span class="tree-chip meta-chip">🔑 ${escHtml(result.dnsProvider)}</span>`);
-  if (result.spfDmarc?.spfProvider) extraMeta.push(`<span class="tree-chip meta-chip">✉ ${escHtml(result.spfDmarc.spfProvider)}</span>`);
+  const customDetected = Object.entries(result.customProviders || {}).filter(([,v]) => v.verdict?.detected);
+  if (customDetected.length) {
+    const chips = customDetected.map(([id, v]) =>
+      `<span class="tree-chip" style="border-color:#94a3b8;color:#94a3b8">${escHtml(v.def?.name || id)} <span class="tree-chip-score">${v.verdict.score}%</span></span>`
+    ).join('');
+    layersHtml += `${arrowDown}<div class="tree-layer" style="--layer-color:#94a3b8"><div class="tree-layer-label">📦 Custom Providers</div><div class="tree-chips">${chips}</div></div>`;
+  }
 
-  const metaRow = extraMeta.length ? `<div class="tree-meta-row">${extraMeta.join('')}</div>` : '';
-  const originNode = `${arrowDown}<div class="tree-node tree-origin">🏠 Origin (${escHtml(domain)})</div>`;
+  const sideItems = [];
+  if (result.dnsProvider) sideItems.push({ icon: '🔑', label: 'DNS', value: result.dnsProvider, color: '#2ecc71' });
+  if (result.spfDmarc?.spfProvider) sideItems.push({ icon: '✉', label: 'Email', value: result.spfDmarc.spfProvider, color: '#f5a623' });
+  if (result.httpsRecord?.ech) sideItems.push({ icon: '🔒', label: 'ECH', value: 'Enabled', color: '#1ed4ff' });
+  if (result.anycast?.diverges) sideItems.push({ icon: '🌍', label: 'Anycast', value: `${result.anycast.uniqueIps?.length || '?'} edges seen`, color: '#1ed4ff' });
+  if (result.layerChain?.chain) sideItems.push({ icon: '📋', label: 'Layer order', value: 'Via header confirmed', color: '#8b5cf6' });
 
-  const content = !detected.length
-    ? '<div class="empty-state" style="padding:24px 0">No providers detected — nothing to visualize.</div>'
-    : `<div class="tree-view">${clientNode}${layersHtml}${originNode}${metaRow}</div>`;
+  const sideBar = sideItems.length ? `
+    <div class="tree-sidebar">
+      <div class="tree-sidebar-title">Infrastructure context</div>
+      ${sideItems.map(s => `<div class="tree-side-item" style="border-left-color:${s.color}">
+        <span class="tree-side-icon">${s.icon}</span>
+        <span class="tree-side-label">${escHtml(s.label)}</span>
+        <span class="tree-side-value" style="color:${s.color}">${escHtml(s.value)}</span>
+      </div>`).join('')}
+    </div>` : '';
+
+  const originNode = `${arrowDown}<div class="tree-node tree-origin">🏠 Origin — ${escHtml(domain)}</div>`;
+
+  const chainNote = (!result.layerChain?.chain && detectedCount > 1)
+    ? `<div class="breakdown-note" style="text-align:center;margin-top:10px">Layer order is grouped by product type — Via header absent, so exact sequence within/between layers is unconfirmed.</div>` : '';
+
+  const treeContent = !detectedCount
+    ? '<div class="empty-state" style="padding:28px 0">No providers detected — nothing to visualize.</div>'
+    : `<div class="tree-wrapper">
+        <div class="tree-view">${clientNode}${layersHtml}${originNode}</div>
+        ${sideBar}
+      </div>${chainNote}`;
+
+  const probeBtn = `<div style="text-align:center;margin-top:14px">
+    <button class="link-btn" id="distProbeBtn">🌍 Probe from 12 global locations (check-host.net)</button>
+    <div id="distProbePanel"></div>
+  </div>`;
 
   resultsEl.innerHTML = `
     <div class="detail-header">
       <button class="back-btn" id="backBtn">← Back</button>
-      <span class="detail-name">🌲 Infrastructure Tree</span>
+      <span class="detail-name">🌲 Infrastructure Stack</span>
     </div>
-    ${content}`;
+    <div class="checks-list" style="padding:12px 14px">
+      ${treeContent}
+      ${probeBtn}
+    </div>`;
+
   document.getElementById('backBtn').addEventListener('click', () => {
     if (resultsEl._scan) renderOverview(resultsEl._scan, resultsEl._cached, resultsEl._diff);
   });
+  document.getElementById('distProbeBtn').addEventListener('click', () =>
+    renderDistributedProbe(domain, document.getElementById('distProbePanel'))
+  );
 }
 
-// Wire C4 tree button in overview toolbar
-// (treeBtn added via insertAdjacentHTML when overview renders)
+// ── Distributed probing UI (check-host.net) ───────────────────
+function renderDistributedProbe(domain, panelEl) {
+  if (!panelEl) return;
+  panelEl.innerHTML = '<div class="empty-state">Probing from 12 global locations… (~10-15s, be patient)</div>';
+  chrome.runtime.sendMessage({ action: 'probeDistributed', domain }, res => {
+    if (!panelEl.isConnected) return; // user navigated away
+    if (res?.error) {
+      panelEl.innerHTML = `<div class="breakdown-note">Probe failed: ${escHtml(res.error)}</div>`;
+      return;
+    }
+    const rows = (res.nodeResults || []).map(n => {
+      const statusClass = n.status === 'ok' ? 'st-done' : n.status === 'fail' ? 'st-error' : 'st-pending';
+      const signals = (n.cdnSignals || []).map(s => `<span class="tree-chip" style="font-size:9.5px;padding:1px 6px">${escHtml(s)}</span>`).join(' ');
+      return `<tr>
+        <td>${escHtml(n.country || '?')}${n.city ? ` · ${escHtml(n.city)}` : ''}</td>
+        <td class="${statusClass}">${n.status}</td>
+        <td>${n.httpCode ?? '—'}</td>
+        <td>${n.latencyMs != null ? n.latencyMs + 'ms' : '—'}</td>
+        <td>${escHtml(n.resolvedIp || '—')}</td>
+        <td>${signals || '—'}</td>
+      </tr>`;
+    }).join('');
+
+    const anycastMsg = res.anycastConfirmed
+      ? `<div class="diff-banner changed">🌍 Anycast confirmed — ${res.uniqueEdgeIps.length} distinct edge IPs seen across ${res.okNodes} nodes: ${res.uniqueEdgeIps.map(escHtml).join(', ')}</div>`
+      : `<div class="diff-banner unchanged">Single consistent IP across all ${res.okNodes} responding nodes — no anycast divergence detected.</div>`;
+
+    panelEl.innerHTML = `
+      ${anycastMsg}
+      <table class="batch-table" style="margin-top:8px;font-size:10.5px">
+        <thead><tr><th>Location</th><th>Status</th><th>HTTP</th><th>Latency</th><th>Resolved IP</th><th>CDN signals</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div class="breakdown-note" style="margin-top:6px">Data via check-host.net public API — ${res.okNodes}/${res.totalNodes} nodes responded.</div>`;
+  });
+}
 
