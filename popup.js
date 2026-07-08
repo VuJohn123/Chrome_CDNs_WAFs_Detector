@@ -608,16 +608,17 @@ const sidePanelBtn = document.getElementById('sidePanelBtn');
 })();
 
 // ── Side panel (improvement #1) ────────────────────────────────
-// Opens the same UI in Chrome's side panel, which — unlike the popup —
-// stays open across tab switches instead of closing the instant focus
-// moves away. Falls back to a no-op with a console note on browsers
-// without chrome.sidePanel (e.g. Firefox, older Chrome).
+// Opens the same UI in a persistent side surface: chrome.sidePanel on
+// Chrome, sidebar_action on Firefox (no equivalent exists on older Chrome —
+// button simply becomes a no-op there, silently).
 if (sidePanelBtn) {
   sidePanelBtn.addEventListener('click', async () => {
     try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (chrome.sidePanel?.open && tab?.windowId != null) {
-        await chrome.sidePanel.open({ windowId: tab.windowId });
+      if (chrome.sidePanel?.open) {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (tab?.windowId != null) await chrome.sidePanel.open({ windowId: tab.windowId });
+      } else if (chrome.sidebarAction?.open) {
+        await chrome.sidebarAction.open();
       }
     } catch (e) { console.warn('Side panel not available:', e); }
   });
@@ -843,92 +844,44 @@ function renderCveLookup(pid, providerName) {
 }
 
 // ── Overview grid ─────────────────────────────────────────────
+// ── Collapsible group helper ────────────────────────────────────
+// Renders a clickable header + a body that starts collapsed or expanded.
+// Used throughout renderOverview to group dense technical output (network
+// signals, the full 24-provider list, tool buttons) behind a tap instead
+// of dumping everything onto the screen at once.
+function groupSection(id, title, count, bodyHtml, startCollapsed) {
+  const countBadge = count > 0 ? `<span class="group-count">${count}</span>` : '';
+  return `
+    <div class="group-block" data-group="${id}">
+      <div class="group-header">
+        <span class="group-chevron">${startCollapsed ? '▸' : '▾'}</span>
+        <span class="group-title">${title}</span>
+        ${countBadge}
+      </div>
+      <div class="group-body${startCollapsed ? ' collapsed' : ''}">${bodyHtml}</div>
+    </div>`;
+}
+
 function renderOverview(result, cached, diff) {
   if (!result?.providers) {
     resultsEl.innerHTML = '<div class="empty-state">No data to display.</div>';
     return;
   }
 
+  const escHtml = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   const order    = Object.keys(PROVIDER_UI);
   const detected = order.filter(id => result.providers[id]?.verdict?.detected === true);
-
-  let summary;
-  if (detected.length === 0) {
-    summary = 'No providers detected';
-  } else {
-    const names = detected.map(id => PROVIDER_UI[id]?.name || id).join(', ');
-    summary = `${detected.length} provider${detected.length > 1 ? 's' : ''}: <strong>${names}</strong>`;
-  }
+  const undetected = order.filter(id => !detected.includes(id));
 
   // Update status bar
   statusTextEl.className = detected.length > 0 ? 'status-ok' : 'status-fail';
   statusTextEl.innerHTML = detected.length > 0
     ? `${detected.length} provider${detected.length > 1 ? 's' : ''} detected — tap to inspect`
     : 'No providers detected';
-  if (cached) {
-    cachedBadgeEl.hidden = false;
-  }
+  if (cached) cachedBadgeEl.hidden = false;
 
-  const overlap = detected.length > 1
-    ? `<div class="multi-warn">⚠ Multi-CDN/WAF deployment detected</div>` : '';
-
-  // ── A4: diff-vs-last-scan banner ──────────────────────────
-  let diffHtml = '';
-  if (diff) {
-    const nameOf = id => PROVIDER_UI[id]?.name || id;
-    if (diff.changed) {
-      const bits = [];
-      if (diff.added?.length)   bits.push(`<b>+${diff.added.map(nameOf).join(', ')}</b>`);
-      if (diff.removed?.length) bits.push(`<b>−${diff.removed.map(nameOf).join(', ')}</b>`);
-      diffHtml = `<div class="diff-banner changed">↻ Changed since ${new Date(diff.priorTs).toLocaleDateString()}: ${bits.join(' · ')}</div>`;
-    } else if (diff.priorTs) {
-      diffHtml = `<div class="diff-banner unchanged">✓ Same provider set as last scan (${new Date(diff.priorTs).toLocaleDateString()})</div>`;
-    }
-  }
-
-  // ── A1: layer-order chain ─────────────────────────────────
-  let chainHtml = '';
-  const lc = result.layerChain;
-  if (lc) {
-    const nameOf = id => PROVIDER_UI[id]?.name || id;
-    if (lc.chain) {
-      const hops = lc.chain.map(id => `<span class="chain-hop" style="--pc:${PROVIDER_UI[id]?.color || ''}">${nameOf(id)}</span>`)
-        .join('<span class="chain-arrow">→</span>');
-      const uncon = lc.unconfirmed?.length
-        ? `<div class="chain-unconfirmed">+ ${lc.unconfirmed.map(nameOf).join(', ')} also detected but position unconfirmed (didn't appear in Via header)</div>` : '';
-      chainHtml = `<div class="chain-row"><span class="chain-label">Layer order (visitor→origin):</span>${hops}${uncon}</div>`;
-    } else if (lc.basis === 'no-via-header' || lc.basis === 'via-incomplete') {
-      chainHtml = `<div class="chain-row"><span class="chain-unknown">Layer order unknown — Via header ${lc.basis === 'no-via-header' ? 'absent' : "didn't name enough hops"} to sequence ${detected.length} detected providers</span></div>`;
-    }
-  }
-
-  const cards = order.map(id => {
-    const ui    = PROVIDER_UI[id];
-    if (!ui) return '';
-    const pv    = result.providers?.[id];
-    const score = pv?.verdict?.score   ?? 0;
-    const label = pv?.verdict?.label   ?? 'Unlikely';
-    const det   = pv?.verdict?.detected ?? false;
-
-    return `
-      <div class="provider-card ${det ? 'detected' : 'undetected'}"
-           data-provider="${id}" style="--pc:${ui.color}">
-        <div class="pc-head">
-          <div class="pc-dot"></div>
-          <span class="pc-name">${ui.name}</span>
-          <span class="pc-score">${score}%</span>
-        </div>
-        <div class="pc-bar-wrap">
-          ${score > 0 ? `<div class="pc-bar" style="width:${score}%"></div>` : ''}
-        </div>
-        <div class="pc-label">${label}</div>
-      </div>`;
-  }).join('');
-
-  const escHtml = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  // ── GROUP 1: Summary — always visible, this is the headline answer ──
   const ipList = result.resolvedIPs || [];
-  const anycastNote = ipList.length > 1
-    ? `<div class="anycast-note">${ipList.length} IPs resolved — tap an IP for cross-verification (PTR/RDAP)</div>` : '';
   const ipsHtml = ipList.length
     ? `<div class="scan-ips">${ipList.map(ip => {
         const ev = result.ipEvidence?.[ip];
@@ -936,71 +889,148 @@ function renderOverview(result, cached, diff) {
         const verified = ev?.matchedProviders?.length ? ' ip-verified' : '';
         return `<span class="ip-chip${verified}" data-ip="${escHtml(ip)}"${tag}>${escHtml(ip)}</span>`;
       }).join('')}</div>` : '';
+  const anycastNote = ipList.length > 1
+    ? `<div class="anycast-note">${ipList.length} IPs resolved — tap an IP for cross-verification (PTR/RDAP)</div>` : '';
 
-  const metaLine = `
-    <div class="scan-meta">
-      <span>${summary}</span>
-      ${ipsHtml}
-    </div>`;
+  const summaryText = detected.length === 0
+    ? 'No providers detected'
+    : `${detected.length} provider${detected.length > 1 ? 's' : ''} detected: <strong>${detected.map(id => PROVIDER_UI[id]?.name || id).join(', ')}</strong>`;
+  const metaLine = `<div class="scan-meta"><span>${summaryText}</span>${ipsHtml}</div>`;
 
-  // ── DNS provider fingerprint (B6) ────────────────────────────
-  const dnsHtml = result.dnsProvider
-    ? `<div class="info-pill">🔑 DNS: <strong>${escHtml(result.dnsProvider)}</strong></div>` : '';
+  // ── STATUS LINES — consolidated into ONE compact block instead of
+  // 5-6 separate stacked banners. Each line is short; only lines that
+  // actually apply are shown. This is the fix for the "still cluttered
+  // with 2+ providers" case (e.g. Cloudflare + Google both detected):
+  // previously diff/overlap/migration/anycast-note/chain were each their
+  // own full-width colored banner, stacking up fast with multi-CDN sites.
+  const statusLines = [];
+  if (diff?.changed) {
+    const nameOf = id => PROVIDER_UI[id]?.name || id;
+    const bits = [];
+    if (diff.added?.length)   bits.push(`+${diff.added.map(nameOf).join(', ')}`);
+    if (diff.removed?.length) bits.push(`−${diff.removed.map(nameOf).join(', ')}`);
+    statusLines.push({ icon: '↻', text: `Changed since ${new Date(diff.priorTs).toLocaleDateString()}: ${bits.join(' · ')}`, tone: 'changed' });
+  } else if (diff?.priorTs) {
+    statusLines.push({ icon: '✓', text: `Same as last scan (${new Date(diff.priorTs).toLocaleDateString()})`, tone: 'unchanged' });
+  }
+  if (detected.length > 1) statusLines.push({ icon: '⚠', text: 'Multi-CDN/WAF deployment', tone: 'changed' });
+  if (result.migrationWarning) statusLines.push({ icon: '⚡', text: result.migrationWarning.note, tone: 'changed' });
+  if (ipList.length > 1) statusLines.push({ icon: '🌍', text: `${ipList.length} IPs resolved (anycast) — tap an IP below for details`, tone: 'unchanged' });
 
-  // ── Firefox TLS intel (B2) ────────────────────────────────────
-  let tlsHtml = '';
-  if (result.tlsIntel) {
-    const t = result.tlsIntel;
-    tlsHtml = `<div class="info-pill tls-pill">🔒 ${escHtml(t.protocol || '')} · ${escHtml(t.cipher || '')}${t.ech ? ' · ECH ✓' : ''}${t.certIssuer ? ` · Issuer: ${escHtml(t.certIssuer.slice(0, 60))}` : ''}</div>`;
+  // Layer order folds into status lines too, as one line instead of its own block
+  const lc = result.layerChain;
+  if (lc?.chain && lc.chain.length > 1) {
+    const nameOf = id => PROVIDER_UI[id]?.name || id;
+    const hops = lc.chain.map(nameOf).join(' → ');
+    statusLines.push({ icon: '📶', text: `Layer order: ${hops}`, tone: 'unchanged' });
+  } else if ((lc?.basis === 'no-via-header' || lc?.basis === 'via-incomplete') && detected.length > 1) {
+    statusLines.push({ icon: '📶', text: 'Layer order unknown (Via header absent/incomplete)', tone: 'unchanged' });
   }
 
-  // ── A1: HTTPS DNS record — ECH, ALPN, IP hints ───────────────
-  let httpsRecordHtml = '';
+  const statusBlock = statusLines.length
+    ? `<div class="status-block">${statusLines.map(l => `<div class="status-line status-${l.tone}"><span class="status-icon">${l.icon}</span>${escHtml(l.text)}</div>`).join('')}</div>`
+    : '';
+
+  // ── GROUP 2: Detected providers ─────────────────────────────────
+  // Single provider → full card (there's room, and it's the headline
+  // answer). 2+ providers → compact rows instead of full cards, since
+  // stacking 2-4 full cards (each with head/bar/label) is exactly what
+  // made the multi-CDN case feel cluttered.
+  const singleProviderMode = (detected.length + (result.customProviders ? Object.values(result.customProviders).filter(v => v.verdict?.detected).length : 0)) <= 1;
+
+  const fullCard = (id, ui, pv, isCustom) => {
+    const score = pv?.verdict?.score ?? 0;
+    const label = pv?.verdict?.label ?? 'Unlikely';
+    return `
+      <div class="provider-card detected" data-provider="${isCustom ? '' : id}" data-custom="${isCustom ? id : ''}" style="--pc:${ui.color}">
+        <div class="pc-head"><div class="pc-dot"></div>
+          <span class="pc-name">${escHtml(ui.name)}</span>
+          <span class="pc-score">${score}%</span></div>
+        <div class="pc-bar-wrap">${score > 0 ? `<div class="pc-bar" style="width:${score}%"></div>` : ''}</div>
+        <div class="pc-label">${escHtml(label)}${isCustom ? ' <em style="font-size:9px">(custom)</em>' : ''}</div>
+      </div>`;
+  };
+  const compactRow = (id, ui, pv, isCustom) => {
+    const score = pv?.verdict?.score ?? 0;
+    const label = pv?.verdict?.label ?? 'Unlikely';
+    return `
+      <div class="provider-row-compact" data-provider="${isCustom ? '' : id}" data-custom="${isCustom ? id : ''}" style="--pc:${ui.color}">
+        <div class="pc-dot"></div>
+        <span class="pc-name">${escHtml(ui.name)}</span>
+        <span class="pc-label-inline">${escHtml(label)}${isCustom ? ' (custom)' : ''}</span>
+        <span class="pc-score">${score}%</span>
+      </div>`;
+  };
+
+  const cardFn = singleProviderMode ? fullCard : compactRow;
+  const detectedCards = detected.map(id => cardFn(id, PROVIDER_UI[id], result.providers[id], false)).join('');
+  const customEntries = Object.entries(result.customProviders || {}).filter(([, v]) => v.verdict?.detected);
+  const customCards = customEntries.map(([id, v]) => cardFn(id, v.def || { color: '#94a3b8', name: id }, v, true)).join('');
+
+  const detectedGroup = (detectedCards || customCards)
+    ? `<div class="${singleProviderMode ? 'providers-grid' : 'providers-compact-list'}">${detectedCards}${customCards}</div>`
+    : `<div class="empty-state" style="padding:16px 0">No providers matched — see "All ${order.length} providers" below to check individually.</div>`;
+
+  // ── GROUP 4: Network & infrastructure signals — collapsed by default ──
+  // This is where round 1-6's DNS/TLS/ECS/anycast/DNSSEC signals live.
+  // Simulated against google.com: this group would hold DNSSEC pill, ECS
+  // banner (Google's own resolver WILL show ECS behavior), anycast spread,
+  // DNS provider, SPF/DMARC, HTTPS-record/ECH — exactly the kind of dense
+  // technical detail that shouldn't be forced onto the main view.
+  const netSignals = [];
+  if (result.dnsProvider) netSignals.push(`<div class="info-pill">🔑 DNS: <strong>${escHtml(result.dnsProvider)}</strong></div>`);
   if (result.httpsRecord) {
-    const hr = result.httpsRecord;
-    const bits = [];
-    if (hr.ech)  bits.push('<strong>ECH ✓</strong>');
-    if (hr.alpn.length) bits.push(`ALPN: ${hr.alpn.map(escHtml).join(', ')}`);
-    if (hr.ipv4hints.length) bits.push(`IP hints: ${hr.ipv4hints.map(escHtml).join(', ')}`);
-    if (bits.length) httpsRecordHtml = `<div class="info-pill">📋 HTTPS RR: ${bits.join(' · ')}</div>`;
+    const hr = result.httpsRecord, bits = [];
+    if (hr.ech) bits.push('<strong>ECH ✓</strong>');
+    if (hr.alpn?.length) bits.push(`ALPN: ${hr.alpn.map(escHtml).join(', ')}`);
+    if (hr.ipv4hints?.length) bits.push(`IP hints: ${hr.ipv4hints.map(escHtml).join(', ')}`);
+    if (bits.length) netSignals.push(`<div class="info-pill">📋 HTTPS RR: ${bits.join(' · ')}</div>`);
   }
-
-  // ── A4: SPF / DMARC ──────────────────────────────────────────
-  let spfHtml = '';
   if (result.spfDmarc) {
-    const sd = result.spfDmarc;
-    const bits = [];
+    const sd = result.spfDmarc, bits = [];
     if (sd.spfProvider) bits.push(`✉ Email: <strong>${escHtml(sd.spfProvider)}</strong>`);
     if (sd.dmarcPolicy) bits.push(`DMARC: p=${escHtml(sd.dmarcPolicy)}`);
-    if (bits.length) spfHtml = `<div class="info-pill">${bits.join(' · ')}</div>`;
+    if (bits.length) netSignals.push(`<div class="info-pill">${bits.join(' · ')}</div>`);
   }
+  if (result.tlsIntel) {
+    const t = result.tlsIntel;
+    netSignals.push(`<div class="info-pill tls-pill">🔒 ${escHtml(t.protocol || '')} · ${escHtml(t.cipher || '')}${t.ech ? ' · ECH ✓' : ''}${t.certIssuer ? ` · Issuer: ${escHtml(t.certIssuer.slice(0, 60))}` : ''}</div>`);
+  }
+  if (result.anycast?.dnssecValidated) netSignals.push(`<span class="info-pill" style="color:var(--green)">🔒 DNSSEC validated</span>`);
+  if (result.anycast?.fastestResolver) netSignals.push(`<span class="info-pill">⚡ Fastest resolver: ${escHtml(result.anycast.fastestResolver)}</span>`);
 
-  // ── A5: Anycast multi-resolver divergence ─────────────────────
-  let anycastRrHtml = '';
+  const netBanners = [];
   if (result.anycast?.diverges) {
-    const rows = result.anycast.entries.map(e =>
-      `${escHtml(e.resolver)}: ${e.ips.map(escHtml).join(', ')}`
-    ).join(' | ');
-    anycastRrHtml = `<div class="diff-banner changed">🌐 Anycast divergence: ${rows}</div>`;
+    const rows = result.anycast.entries.map(e => `${escHtml(e.resolver)}: ${e.ips.map(escHtml).join(', ')}`).join(' | ');
+    netBanners.push(`<div class="diff-banner changed">🌐 Anycast divergence: ${rows}</div>`);
+  }
+  if (result.anycast?.ecsLeakSuspected) {
+    netBanners.push(`<div class="diff-banner changed">📡 ECS geo-routing suspected — Google's DoH (sends partial client IP via ECS) and Cloudflare's DoH (no ECS) resolved to fully different edge IPs.</div>`);
   }
 
-  // ── Migration warning (improvement #15) ──────────────────────
-  const migHtml = result.migrationWarning
-    ? `<div class="diff-banner changed">⚡ ${escHtml(result.migrationWarning.note)}</div>` : '';
+  const netGroupBody = netSignals.length || netBanners.length
+    ? `${netBanners.join('')}<div class="info-bar">${netSignals.join('')}</div>`
+    : `<div class="breakdown-note">No additional DNS/TLS signals surfaced for this scan.</div>`;
+  const netGroupCount = netSignals.length + netBanners.length;
 
-  // ── Custom provider hits ──────────────────────────────────────
-  const customCards = Object.entries(result.customProviders || {})
-    .filter(([, v]) => v.verdict?.detected)
-    .map(([id, v]) => `
-      <div class="provider-card detected" style="--pc:${escHtml(v.def?.color || '#94a3b8')}">
-        <div class="pc-head"><div class="pc-dot"></div>
-          <span class="pc-name">${escHtml(v.def?.name || id)}</span>
-          <span class="pc-score">${v.verdict.score}%</span></div>
-        <div class="pc-label">${escHtml(v.verdict.label)} <em style="font-size:9px">(custom)</em></div>
-      </div>`).join('');
+  // ── GROUP 5: All providers (including undetected) — collapsed, opt-in ──
+  const allCards = order.map(id => {
+    const ui = PROVIDER_UI[id]; if (!ui) return '';
+    const pv = result.providers?.[id];
+    const score = pv?.verdict?.score ?? 0;
+    const label = pv?.verdict?.label ?? 'Unlikely';
+    const det = pv?.verdict?.detected ?? false;
+    return `
+      <div class="provider-card ${det ? 'detected' : 'undetected'}" data-provider="${id}" style="--pc:${ui.color}">
+        <div class="pc-head"><div class="pc-dot"></div><span class="pc-name">${escHtml(ui.name)}</span><span class="pc-score">${score}%</span></div>
+        <div class="pc-bar-wrap">${score > 0 ? `<div class="pc-bar" style="width:${score}%"></div>` : ''}</div>
+        <div class="pc-label">${escHtml(label)}</div>
+      </div>`;
+  }).join('');
 
-  const exportRow = `
-    <div class="export-row">
+  // ── GROUP 6: Tools — export/share/analysis actions, collapsed ──────
+  const toolsGroupBody = `
+    <div class="tools-grid">
       <button id="exportJsonBtn">⇩ JSON</button>
       <button id="exportCsvBtn">⇩ CSV</button>
       <button id="exportMdBtn">⇩ Markdown</button>
@@ -1011,13 +1041,25 @@ function renderOverview(result, cached, diff) {
       <button id="treeBtn">🌲 Tree</button>
     </div>`;
 
-  const infoBar = (dnsHtml || tlsHtml || httpsRecordHtml || spfHtml)
-    ? `<div class="info-bar">${dnsHtml}${httpsRecordHtml}${spfHtml}${tlsHtml}</div>` : '';
+  // ── Assemble: always-visible summary, then collapsible groups ──────
+  resultsEl.innerHTML = `
+    ${metaLine}
+    ${statusBlock}
+    ${detectedGroup}
 
-  resultsEl.innerHTML = metaLine + diffHtml + chainHtml + anycastRrHtml + migHtml + overlap + anycastNote
-    + infoBar
-    + `<div class="providers-grid">${cards}${customCards}</div>`
-    + exportRow;
+    ${groupSection('net-signals', '📡 Network & infrastructure signals', netGroupCount, netGroupBody, netGroupCount === 0)}
+    ${groupSection('all-providers', `📋 All ${order.length} providers (incl. undetected)`, undetected.length, `<div class="providers-grid">${allCards}</div>`, true)}
+    ${groupSection('tools', '🛠 Tools & export', 8, toolsGroupBody, true)}
+  `;
+
+  // Wire collapsible group toggles
+  resultsEl.querySelectorAll('.group-header').forEach(h => {
+    h.addEventListener('click', () => {
+      const body = h.nextElementSibling;
+      const collapsed = body.classList.toggle('collapsed');
+      h.querySelector('.group-chevron').textContent = collapsed ? '▸' : '▾';
+    });
+  });
 
   document.getElementById('exportJsonBtn').addEventListener('click', () => exportJson(result));
   document.getElementById('exportCsvBtn').addEventListener('click', () => exportCsv(result));
@@ -1035,7 +1077,7 @@ function renderOverview(result, cached, diff) {
     });
   });
 
-  resultsEl.querySelectorAll('.provider-card').forEach(card =>
+  resultsEl.querySelectorAll('.provider-card, .provider-row-compact').forEach(card =>
     card.addEventListener('click', () => {
       if (card.dataset.provider) renderDetail(result, card.dataset.provider);
     })
@@ -1586,9 +1628,17 @@ function renderSettings(settings) {
       <button class="btn-primary-sm" id="importCodeBtn">Load scan</button>
       <div id="importCodeResult"></div>
 
+      <div class="settings-section-title">Performance intelligence (Core Web Vitals)</div>
+      <div class="breakdown-note">Captures the CURRENT tab's real Core Web Vitals (LCP, CLS, TTFB) and attributes them to whichever provider the scan detected for that domain — builds a local trend over time, and shows how much load time third-party scripts (analytics, ads, fonts) account for versus the main domain.</div>
+      <button class="btn-primary-sm" id="captureVitalsBtn">📊 Capture vitals from current tab</button>
+      <div id="vitalsCaptureResult"></div>
+      <button class="link-btn" id="viewRumSummaryBtn" style="margin-top:8px">📈 View performance summary by provider</button>
+      <div id="rumSummaryPanel"></div>
+
       <div class="settings-section-title">About</div>
       <div class="breakdown-note">CDN/WAF Detector v9.1 — local scoring only, no telemetry by default.<br>
-      Keyboard shortcuts: <strong>Ctrl+Shift+S</strong> open popup · <strong>Ctrl+Shift+D</strong> side panel · <strong>Ctrl+Shift+V</strong> scan clipboard.</div>
+      Keyboard shortcuts: <strong>Ctrl+Shift+S</strong> open popup · <strong>Ctrl+Shift+D</strong> side panel · <strong>Ctrl+Shift+V</strong> scan clipboard.<br>
+      Pinned domains and watchlist sync across your Chrome profiles automatically via <code>chrome.storage.sync</code> (same Google account, no server needed).</div>
 
       <div class="settings-section-title">Threat intel API keys (D3 — optional)</div>
       <div class="breakdown-note">Keys are stored locally and sent only to Shodan/Censys when you click an IP lookup. Leave blank to use only the free Shodan InternetDB (no key needed).</div>
@@ -1644,6 +1694,74 @@ function renderSettings(settings) {
       renderOverview(res.result, false, null);
     });
   });
+
+  // ── #3/#4: Capture Core Web Vitals + waterfall from the active tab ──
+  document.getElementById('captureVitalsBtn').addEventListener('click', async () => {
+    const el = document.getElementById('vitalsCaptureResult');
+    el.innerHTML = '<div class="empty-state">Capturing…</div>';
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab?.id || !tab.url || !/^https?:/.test(tab.url)) {
+        el.innerHTML = '<div class="breakdown-note">Active tab must be a regular http(s) page.</div>';
+        return;
+      }
+      const domain = new URL(tab.url).hostname;
+      chrome.runtime.sendMessage({ action: 'getVitalsAndWaterfall', tabId: tab.id }, async res => {
+        const data = res?.data;
+        if (!data) { el.innerHTML = '<div class="breakdown-note">Could not read performance data from this tab (try reloading it first).</div>'; return; }
+
+        // Get cached scan result for this domain to know which provider to attribute to
+        chrome.runtime.sendMessage({ action: 'scan', domain, forceRefresh: false }, async scanRes => {
+          const providerIds = Object.entries(scanRes?.providers || {})
+            .filter(([, v]) => v.verdict?.detected).map(([id]) => id);
+
+          if (providerIds.length && data.vitals) {
+            chrome.runtime.sendMessage({ action: 'recordRumSample', providerIds, vitals: data.vitals });
+          }
+          chrome.runtime.sendMessage({
+            action: 'classifyThirdParty', entries: data.resourceEntries || [], mainDomain: data.mainDomain
+          }, waterfallRes => {
+            const w = waterfallRes?.result;
+            const vitalsHtml = `
+              <div class="tls-panel">
+                <strong>Vitals — ${escHtml(domain)}</strong><br>
+                LCP: ${data.vitals.lcp != null ? Math.round(data.vitals.lcp) + 'ms' : '—'} ·
+                CLS: ${data.vitals.cls ?? '—'} ·
+                TTFB: ${data.vitals.ttfb != null ? Math.round(data.vitals.ttfb) + 'ms' : '—'}
+                ${providerIds.length ? `<br><span class="breakdown-note">Attributed to: ${providerIds.map(id => PROVIDER_UI[id]?.name || id).join(', ')}</span>` : '<br><span class="breakdown-note">No detected provider to attribute this sample to (scan this domain first).</span>'}
+              </div>`;
+            const waterfallHtml = w ? `
+              <div class="tls-panel" style="margin-top:8px">
+                <strong>Third-party breakdown</strong><br>
+                Main domain: ${w.mainDomainTimeMs}ms · Third-party: ${w.thirdPartyTimeMs}ms (${w.thirdPartyPct}%)
+                <div style="margin-top:6px">${w.buckets.slice(0, 6).map(b => `<div class="breakdown-note">• ${escHtml(b.category)}: ${Math.round(b.totalMs)}ms (${Object.keys(b.items).length} resource${Object.keys(b.items).length !== 1 ? 's' : ''})</div>`).join('')}</div>
+              </div>` : '';
+            el.innerHTML = vitalsHtml + waterfallHtml;
+          });
+        });
+      });
+    } catch (e) {
+      el.innerHTML = `<div class="breakdown-note">Error: ${escHtml(e.message)}</div>`;
+    }
+  });
+
+  document.getElementById('viewRumSummaryBtn').addEventListener('click', () => {
+    const panel = document.getElementById('rumSummaryPanel');
+    panel.innerHTML = '<div class="empty-state">Loading…</div>';
+    chrome.runtime.sendMessage({ action: 'getRumSummary' }, res => {
+      const summary = res?.summary || {};
+      const entries = Object.entries(summary);
+      if (!entries.length) { panel.innerHTML = '<div class="breakdown-note">No samples yet — capture vitals a few times across different sites to build this up.</div>'; return; }
+      const rows = entries.map(([pid, s]) => `
+        <div class="tls-panel">
+          <strong>${escHtml(PROVIDER_UI[pid]?.name || pid)}</strong> (${s.sampleCount} sample${s.sampleCount !== 1 ? 's' : ''})<br>
+          Avg LCP: ${s.avgLCP != null ? s.avgLCP + 'ms' : '—'} · Median LCP: ${s.medianLCP != null ? s.medianLCP + 'ms' : '—'}<br>
+          Avg TTFB: ${s.avgTTFB != null ? s.avgTTFB + 'ms' : '—'} · Avg CLS: ${s.avgCLS ?? '—'}
+        </div>`).join('');
+      panel.innerHTML = `<div class="breakdown-note" style="margin-bottom:6px">Based on your own browsing — not a synthetic benchmark.</div>${rows}`;
+    });
+  });
+
   document.getElementById('backBtn').addEventListener('click', () => {
     if (resultsEl._scan) renderOverview(resultsEl._scan, resultsEl._cached, resultsEl._diff);
     else resultsEl.innerHTML = '';
@@ -1911,6 +2029,8 @@ function renderTimeline(domain) {
         <div style="font-size:11px;color:var(--text-dim);margin-top:3px">
           ${detected.length ? escHtml(detected.join(', ')) : 'None detected'}
           ${s.result?.dnsProvider ? ` · DNS: ${escHtml(s.result.dnsProvider)}` : ''}
+          ${s.result?.anycast?.dnssecValidated ? ' · 🔒 DNSSEC' : ''}
+          ${s.result?.anycast?.ecsLeakSuspected ? ' · 📡 ECS leak' : ''}
         </div>
       </div>`;
     }).join('');
@@ -2055,6 +2175,9 @@ function renderTree(result, domain) {
   if (result.httpsRecord?.ech) sideItems.push({ icon: '🔒', label: 'ECH', value: 'Enabled', color: '#1ed4ff' });
   if (result.anycast?.diverges) sideItems.push({ icon: '🌍', label: 'Anycast', value: `${result.anycast.uniqueIps?.length || '?'} edges seen`, color: '#1ed4ff' });
   if (result.layerChain?.chain) sideItems.push({ icon: '📋', label: 'Layer order', value: 'Via header confirmed', color: '#8b5cf6' });
+  if (result.anycast?.dnssecValidated) sideItems.push({ icon: '🔒', label: 'DNSSEC', value: 'Validated', color: '#2ecc71' });
+  if (result.anycast?.ecsLeakSuspected) sideItems.push({ icon: '📡', label: 'ECS leak', value: 'Suspected', color: '#f0555a' });
+  if (result.anycast?.fastestResolver) sideItems.push({ icon: '⚡', label: 'Fastest resolver', value: result.anycast.fastestResolver, color: '#94a3b8' });
 
   const sideBar = sideItems.length ? `
     <div class="tree-sidebar">
@@ -2083,6 +2206,17 @@ function renderTree(result, domain) {
     <div id="distProbePanel"></div>
   </div>`;
 
+  const round5Row = `
+    <div class="tree-action-row">
+      <button class="link-btn" id="wellKnownBtn">📄 robots.txt / security.txt</button>
+      <button class="link-btn" id="blastRadiusBtn">💥 Blast radius</button>
+      <button class="link-btn" id="waybackBtn">🕰 Wayback history</button>
+      <button class="link-btn" id="fingerprintBtn">🔖 Fingerprint string</button>
+      <button class="link-btn" id="statusPageBtn">📡 Check status pages</button>
+      <button class="link-btn" id="dnsBlockBtn">🚧 Check DNS blocking</button>
+    </div>
+    <div id="round5Panel"></div>`;
+
   resultsEl.innerHTML = `
     <div class="detail-header">
       <button class="back-btn" id="backBtn">← Back</button>
@@ -2091,6 +2225,7 @@ function renderTree(result, domain) {
     <div class="checks-list" style="padding:12px 14px">
       ${treeContent}
       ${probeBtn}
+      ${round5Row}
     </div>`;
 
   document.getElementById('backBtn').addEventListener('click', () => {
@@ -2099,41 +2234,182 @@ function renderTree(result, domain) {
   document.getElementById('distProbeBtn').addEventListener('click', () =>
     renderDistributedProbe(domain, document.getElementById('distProbePanel'))
   );
+  document.getElementById('wellKnownBtn').addEventListener('click', () => renderWellKnown(domain));
+  document.getElementById('blastRadiusBtn').addEventListener('click', () => renderBlastRadius(result));
+  document.getElementById('waybackBtn').addEventListener('click', () => renderWayback(domain));
+  document.getElementById('fingerprintBtn').addEventListener('click', () => renderFingerprint(result));
+  document.getElementById('statusPageBtn').addEventListener('click', () => renderStatusCheck(result));
+  document.getElementById('dnsBlockBtn').addEventListener('click', () => renderDnsBlockCheck(domain));
+}
+
+// ── #1: DNS-blocking/censorship diagnostic panel ────────────────
+// Reports whether a policy-filtering DNS resolver behaves differently from
+// a neutral one for this domain. Purely diagnostic — never attempts to
+// route around or bypass anything it finds.
+function renderDnsBlockCheck(domain) {
+  const panel = document.getElementById('round5Panel');
+  if (!panel) return;
+  panel.innerHTML = '<div class="empty-state">Comparing a neutral resolver against a policy-filtering resolver…</div>';
+  chrome.runtime.sendMessage({ action: 'checkDnsBlocking', domain }, res => {
+    if (!panel.isConnected) return;
+    if (!res?.checked) {
+      panel.innerHTML = `<div class="breakdown-note">Could not complete check: ${escHtml(res?.reason || 'unknown error')}</div>`;
+      return;
+    }
+    const confidenceLabel = res.confidence === 'medium-high' ? 'Medium-high confidence'
+      : res.confidence === 'low-medium' ? 'Low-medium confidence — this IP list can go stale' : '';
+    const banner = res.blocked
+      ? `<div class="diff-banner changed">🚧 Possible DNS-policy block detected${confidenceLabel ? ` (${confidenceLabel})` : ''}</div>`
+      : `<div class="diff-banner unchanged">✓ No DNS-policy blocking detected</div>`;
+    const cacheNote = res.fromCache ? '<div class="breakdown-note" style="margin-top:4px">Cached result (rechecked automatically every 10 min).</div>' : '';
+    panel.innerHTML = `
+      ${banner}
+      <div class="tls-panel">${escHtml(res.detail)}</div>
+      ${cacheNote}
+      <div class="breakdown-note" style="margin-top:6px">This compares Cloudflare's DNS (no content policy) against OpenDNS FamilyShield (blocks by policy). A difference here reflects DNS-layer blocking only — it says nothing about IP-level or DPI-based blocking, which this check cannot see. A "no answer at all" mismatch is more reliable than an IP-match, since block-page IPs can change over time.</div>`;
+  });
+}
+
+// ── #7: robots.txt / security.txt OSINT panel ──────────────────
+function renderWellKnown(domain) {
+  const panel = document.getElementById('round5Panel');
+  if (!panel) return;
+  panel.innerHTML = '<div class="empty-state">Fetching robots.txt and security.txt…</div>';
+  chrome.runtime.sendMessage({ action: 'probeWellKnownFiles', domain }, res => {
+    if (!panel.isConnected) return;
+    const findingsHtml = (res.findings || []).map(f => `<div class="breakdown-note">• ${escHtml(f)}</div>`).join('');
+    const robotsHtml = res.robotsTxt
+      ? `<div class="tls-panel"><strong>robots.txt</strong> (${res.robotsTxt.length} bytes)<br>
+         <pre style="white-space:pre-wrap;font-size:9.5px;color:var(--text-dim);margin-top:6px;max-height:120px;overflow:auto">${escHtml(res.robotsTxt.snippet)}</pre></div>`
+      : '<div class="breakdown-note">No robots.txt found.</div>';
+    const secHtml = res.securityTxt
+      ? `<div class="tls-panel"><strong>${escHtml(res.securityTxt.path)}</strong> (${res.securityTxt.length} bytes)<br>
+         <pre style="white-space:pre-wrap;font-size:9.5px;color:var(--text-dim);margin-top:6px;max-height:120px;overflow:auto">${escHtml(res.securityTxt.snippet)}</pre></div>`
+      : '<div class="breakdown-note">No security.txt found (checked /.well-known/security.txt and /security.txt).</div>';
+    panel.innerHTML = `${findingsHtml}${robotsHtml}${secHtml}`;
+  });
+}
+
+// ── #8: Blast radius — hostnames sharing the same IP ────────────
+function renderBlastRadius(result) {
+  const panel = document.getElementById('round5Panel');
+  if (!panel) return;
+  const ips = result.resolvedIPs || [];
+  if (!ips.length) { panel.innerHTML = '<div class="breakdown-note">No resolved IPs to check.</div>'; return; }
+  panel.innerHTML = '<div class="empty-state">Checking shared-hostname data via Shodan InternetDB…</div>';
+  Promise.all(ips.map(ip => new Promise(resolve =>
+    chrome.runtime.sendMessage({ action: 'checkBlastRadius', ip }, r => resolve(r))
+  ))).then(results => {
+    if (!panel.isConnected) return;
+    const rows = results.map(r => `
+      <div class="tls-panel">
+        <strong>${escHtml(r.ip)}</strong><br>
+        ${r.hostnames.length
+          ? `<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">${r.hostnames.slice(0, 20).map(h => `<span class="info-pill">${escHtml(h)}</span>`).join('')}</div>`
+          : ''}
+        <div class="breakdown-note" style="margin-top:6px">${escHtml(r.note)}</div>
+      </div>`).join('');
+    panel.innerHTML = rows;
+  });
+}
+
+// ── #9: CDN status-page correlation ─────────────────────────────
+function renderStatusCheck(result) {
+  const panel = document.getElementById('round5Panel');
+  if (!panel) return;
+  const detected = Object.entries(result.providers || {})
+    .filter(([, v]) => v.verdict?.detected).map(([id]) => id);
+  const checkable = detected.filter(id => ['cloudflare','fastly','akamai','vercel','netlify','google'].includes(id));
+  if (!checkable.length) { panel.innerHTML = '<div class="breakdown-note">No detected providers have a known public status page.</div>'; return; }
+  panel.innerHTML = '<div class="empty-state">Checking provider status pages…</div>';
+  Promise.all(checkable.map(id => new Promise(resolve =>
+    chrome.runtime.sendMessage({ action: 'checkProviderStatus', providerId: id }, r => resolve({ id, status: r?.status }))
+  ))).then(results => {
+    if (!panel.isConnected) return;
+    const rows = results.map(({ id, status }) => {
+      const name = PROVIDER_UI[id]?.name || id;
+      if (!status) return `<div class="tls-panel">${escHtml(name)}: <span class="breakdown-note" style="display:inline">status page unavailable</span></div>`;
+      const indicatorColor = status.indicator === 'none' ? 'var(--green)' : status.indicator === 'incident' ? 'var(--red)' : 'var(--amber)';
+      return `<div class="tls-panel"><strong style="color:${indicatorColor}">${escHtml(name)}</strong> — ${escHtml(status.description || status.indicator)}</div>`;
+    }).join('');
+    panel.innerHTML = `<div class="breakdown-note" style="margin-bottom:6px">Useful for telling apart "provider actually changed" vs "provider is just having an outage" in watchlist diffs.</div>${rows}`;
+  });
+}
+
+// ── #10: Shareable infrastructure fingerprint string ────────────
+function renderFingerprint(result) {
+  const panel = document.getElementById('round5Panel');
+  if (!panel) return;
+  chrome.runtime.sendMessage({ action: 'buildFingerprint', result }, res => {
+    if (!panel.isConnected) return;
+    if (!res?.fingerprint) { panel.innerHTML = '<div class="breakdown-note">Could not build fingerprint.</div>'; return; }
+    panel.innerHTML = `
+      <div class="tls-panel">
+        <strong>Infrastructure fingerprint</strong>
+        <div style="font-family:var(--mono);font-size:12px;margin-top:6px;word-break:break-all;color:var(--accent)">${escHtml(res.fingerprint)}</div>
+        <button class="link-btn" id="copyFingerprintBtn" style="margin-top:8px">⧉ Copy</button>
+        <div class="breakdown-note" style="margin-top:6px">Compact summary of detected providers, DNS provider, ECH/anycast flags, and layer count — paste this to compare with another scan at a glance. Not a security hash.</div>
+      </div>`;
+    document.getElementById('copyFingerprintBtn').addEventListener('click', () => {
+      navigator.clipboard.writeText(res.fingerprint).catch(() => {});
+      const btn = document.getElementById('copyFingerprintBtn');
+      if (btn) { btn.textContent = '✓ Copied!'; setTimeout(() => { if (btn) btn.textContent = '⧉ Copy'; }, 2000); }
+    });
+  });
+}
+
+// ── #11: Wayback Machine historical cross-check ─────────────────
+function renderWayback(domain) {
+  const panel = document.getElementById('round5Panel');
+  if (!panel) return;
+  panel.innerHTML = '<div class="empty-state">Querying Wayback Machine CDX API…</div>';
+  chrome.runtime.sendMessage({ action: 'queryWaybackHistory', domain }, res => {
+    if (!panel.isConnected) return;
+    const data = res?.data;
+    if (!data) { panel.innerHTML = '<div class="breakdown-note">No Wayback Machine snapshots found for this domain.</div>'; return; }
+    panel.innerHTML = `
+      <div class="tls-panel">
+        <strong>Archive history</strong><br>
+        First snapshot: <strong>${escHtml(data.earliestYear)}</strong> (${escHtml(data.firstSnapshot)})<br>
+        <a href="https://web.archive.org/web/${escHtml(data.firstSnapshot)}/${escHtml(domain)}" target="_blank" rel="noopener" style="color:var(--accent);font-size:10.5px">View earliest archived snapshot ↗</a>
+        <div class="breakdown-note" style="margin-top:6px">Extends historical context beyond this extension's own local scan history (which only goes back to when you started scanning).</div>
+      </div>`;
+  });
 }
 
 // ── Distributed probing UI (check-host.net) ───────────────────
 function renderDistributedProbe(domain, panelEl) {
   if (!panelEl) return;
-  panelEl.innerHTML = '<div class="empty-state">Probing from 12 global locations… (~10-15s, be patient)</div>';
+  panelEl.innerHTML = '<div class="empty-state">Probing from up to 12 global locations… (~10-15s, be patient)</div>';
   chrome.runtime.sendMessage({ action: 'probeDistributed', domain }, res => {
     if (!panelEl.isConnected) return; // user navigated away
     if (res?.error) {
-      panelEl.innerHTML = `<div class="breakdown-note">Probe failed: ${escHtml(res.error)}</div>`;
+      panelEl.innerHTML = `<div class="breakdown-note">Probe failed: ${escHtml(res.error)}</div>
+        <div class="breakdown-note" style="margin-top:4px">This uses the free check-host.net public API. If this keeps failing, their service may be temporarily rate-limiting or blocking this host.</div>`;
       return;
     }
-    const rows = (res.nodeResults || []).map(n => {
+    if (!res.nodeResults?.length) {
+      panelEl.innerHTML = '<div class="breakdown-note">No nodes responded. Try again in a moment.</div>';
+      return;
+    }
+    const rows = res.nodeResults.map(n => {
       const statusClass = n.status === 'ok' ? 'st-done' : n.status === 'fail' ? 'st-error' : 'st-pending';
-      const signals = (n.cdnSignals || []).map(s => `<span class="tree-chip" style="font-size:9.5px;padding:1px 6px">${escHtml(s)}</span>`).join(' ');
       return `<tr>
         <td>${escHtml(n.country || '?')}${n.city ? ` · ${escHtml(n.city)}` : ''}</td>
         <td class="${statusClass}">${n.status}</td>
         <td>${n.httpCode ?? '—'}</td>
         <td>${n.latencyMs != null ? n.latencyMs + 'ms' : '—'}</td>
-        <td>${escHtml(n.resolvedIp || '—')}</td>
-        <td>${signals || '—'}</td>
+        <td style="font-size:9.5px;color:var(--text-faint)">${escHtml(n.asn || '—')}</td>
       </tr>`;
     }).join('');
 
-    const anycastMsg = res.anycastConfirmed
-      ? `<div class="diff-banner changed">🌍 Anycast confirmed — ${res.uniqueEdgeIps.length} distinct edge IPs seen across ${res.okNodes} nodes: ${res.uniqueEdgeIps.map(escHtml).join(', ')}</div>`
-      : `<div class="diff-banner unchanged">Single consistent IP across all ${res.okNodes} responding nodes — no anycast divergence detected.</div>`;
-
     panelEl.innerHTML = `
-      ${anycastMsg}
-      <table class="batch-table" style="margin-top:8px;font-size:10.5px">
-        <thead><tr><th>Location</th><th>Status</th><th>HTTP</th><th>Latency</th><th>Resolved IP</th><th>CDN signals</th></tr></thead>
+      <div class="breakdown-note" style="margin-bottom:6px">${res.okNodes}/${res.totalNodes} nodes reached the domain successfully. This shows reachability + latency from real global vantage points — it does not read response headers or confirm anycast (that's what the Anycast check above already does via DNS).</div>
+      <table class="batch-table" style="margin-top:4px;font-size:10.5px">
+        <thead><tr><th>Location</th><th>Status</th><th>HTTP</th><th>Latency</th><th>Probe node ASN</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
+      <div class="breakdown-note" style="margin-top:6px">Data via <a href="https://check-host.net" target="_blank" rel="noopener" style="color:var(--accent)">check-host.net</a> public API.</div>
       <div class="breakdown-note" style="margin-top:6px">Data via check-host.net public API — ${res.okNodes}/${res.totalNodes} nodes responded.</div>`;
   });
 }

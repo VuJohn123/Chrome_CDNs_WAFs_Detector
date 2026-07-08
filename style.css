@@ -764,6 +764,130 @@ body.sidepanel-mode .checks-list { max-height: none; }
 
 /* DNS / TLS info bar */
 .info-bar { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 0 8px; }
+
+/* ── Collapsible groups — the anti-clutter redesign ─────────────── */
+/* ── Consolidated status block — replaces 5-6 separate stacked banners ── */
+.status-block {
+  margin: 8px 0;
+  border-radius: var(--radius);
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+.status-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  font-size: 11.5px;
+  border-bottom: 1px solid var(--border);
+}
+.status-line:last-child { border-bottom: none; }
+.status-icon { flex-shrink: 0; font-size: 12px; }
+.status-changed { background: var(--amber-dim); color: var(--amber); }
+.status-unchanged { background: var(--bg-3); color: var(--text-dim); }
+
+/* ── Compact provider rows — used instead of full cards when 2+ providers
+   are detected, so a multi-CDN scan (e.g. Cloudflare + Google) doesn't
+   stack several tall cards on top of each other ── */
+.providers-compact-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0;
+}
+.provider-row-compact {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--pc, var(--green));
+  background: var(--bg-2);
+  cursor: pointer;
+  transition: background .12s;
+}
+.provider-row-compact:hover { background: var(--bg-3); }
+.provider-row-compact .pc-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--pc, var(--green)); flex-shrink: 0;
+}
+.provider-row-compact .pc-name { font-weight: 600; font-size: 12px; flex-shrink: 0; }
+.provider-row-compact .pc-label-inline {
+  font-size: 10.5px; color: var(--text-faint); flex: 1;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.provider-row-compact .pc-score {
+  font-family: var(--mono); font-size: 11px; color: var(--pc, var(--green));
+  font-weight: 700; flex-shrink: 0;
+}
+
+.group-block {
+  margin: 10px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--bg-2);
+}
+.group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  user-select: none;
+  background: var(--bg-3);
+  transition: background .12s;
+}
+.group-header:hover { background: var(--bg-4); }
+.group-chevron {
+  font-size: 10px;
+  color: var(--text-faint);
+  width: 10px;
+  flex-shrink: 0;
+}
+.group-title {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text-dim);
+  flex: 1;
+}
+.group-count {
+  font-size: 9.5px;
+  font-weight: 700;
+  background: var(--accent-dim);
+  color: var(--accent);
+  padding: 1px 7px;
+  border-radius: 20px;
+}
+.group-body {
+  padding: 12px;
+  max-height: 2000px;
+  overflow: hidden;
+  transition: max-height .2s ease, padding .2s ease;
+}
+.group-body.collapsed {
+  max-height: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+/* ── Tools group — grid of action buttons instead of a cramped row ── */
+.tools-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px;
+}
+.tools-grid button {
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 10.5px;
+  padding: 8px 6px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.tools-grid button:hover { color: var(--text); border-color: var(--accent); background: var(--accent-dim); }
 .info-pill {
   font-size: 10px; padding: 3px 8px; border-radius: 20px;
   background: var(--bg-3); border: 1px solid var(--border);
@@ -989,6 +1113,23 @@ body.sidepanel-mode .checks-list { max-height: none; }
 .tree-side-icon { font-size: 12px; }
 .tree-side-label { color: var(--text-faint); font-size: 9.5px; }
 .tree-side-value { font-weight: 600; margin-left: auto; }
+
+.tree-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: center;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.tree-action-row .link-btn {
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+}
+.tree-action-row .link-btn:hover { border-color: var(--accent); }
 
 /* ── Export row: allow wrapping for the extra buttons ─────────── */
 .export-row { flex-wrap: wrap; }

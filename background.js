@@ -469,18 +469,24 @@ async function diffAgainstHistory(domain, result) {
 }
 
 // ── C3: Pinned/bookmarked domains (manual, distinct from auto history) ─
+// #6: synced via chrome.storage.sync — see note on WATCHLIST_KEY above.
 const PINS_KEY = 'pinned_domains';
 async function getPins() {
-  try { const { [PINS_KEY]: list = [] } = await chrome.storage.local.get(PINS_KEY); return list; }
-  catch { return []; }
+  try { const { [PINS_KEY]: list = [] } = await chrome.storage.sync.get(PINS_KEY); return list; }
+  catch {
+    try { const { [PINS_KEY]: list = [] } = await chrome.storage.local.get(PINS_KEY); return list; }
+    catch { return []; }
+  }
 }
 async function togglePin(domain) {
   try {
     const list = await getPins();
     const idx = list.indexOf(domain);
     if (idx >= 0) list.splice(idx, 1); else list.unshift(domain);
-    await chrome.storage.local.set({ [PINS_KEY]: list.slice(0, 200) });
-    return list;
+    const trimmed = list.slice(0, 200);
+    try { await chrome.storage.sync.set({ [PINS_KEY]: trimmed }); }
+    catch { await chrome.storage.local.set({ [PINS_KEY]: trimmed }); }
+    return trimmed;
   } catch { return []; }
 }
 
@@ -488,21 +494,32 @@ async function togglePin(domain) {
 // Distinct from pins: pinning is "quick access", watching adds a scheduled
 // background re-scan via chrome.alarms and a chrome.notifications alert
 // when the detected provider set changes between checks.
+//
+// #6: Uses chrome.storage.sync (not .local) so the watchlist automatically
+// syncs across every Chrome profile signed into the same Google account —
+// no server, no Worker, no setup. Chrome's sync quota is small (100KB
+// total, ~8KB/item), which is why only small string lists (watchlist, pins)
+// use sync; custom provider JSON stays in .local since it can be larger.
 const WATCHLIST_KEY = 'watchlist_domains';
 const WATCHLIST_ALARM = 'cdnwaf-watchlist-check';
 const WATCHLIST_DEFAULT_INTERVAL_MIN = 360; // 6h — gentle default, configurable in Settings
 
 async function getWatchlist() {
-  try { const { [WATCHLIST_KEY]: list = [] } = await chrome.storage.local.get(WATCHLIST_KEY); return list; }
-  catch { return []; }
+  try { const { [WATCHLIST_KEY]: list = [] } = await chrome.storage.sync.get(WATCHLIST_KEY); return list; }
+  catch { // sync unavailable (disabled by admin policy, etc.) — fall back to local
+    try { const { [WATCHLIST_KEY]: list = [] } = await chrome.storage.local.get(WATCHLIST_KEY); return list; }
+    catch { return []; }
+  }
 }
 async function toggleWatch(domain) {
   try {
     const list = await getWatchlist();
     const idx = list.indexOf(domain);
     if (idx >= 0) list.splice(idx, 1); else list.unshift(domain);
-    await chrome.storage.local.set({ [WATCHLIST_KEY]: list.slice(0, 100) });
-    return list;
+    const trimmed = list.slice(0, 100);
+    try { await chrome.storage.sync.set({ [WATCHLIST_KEY]: trimmed }); }
+    catch { await chrome.storage.local.set({ [WATCHLIST_KEY]: trimmed }); }
+    return trimmed;
   } catch { return []; }
 }
 async function ensureWatchlistAlarm() {
@@ -1378,33 +1395,179 @@ try {
 const KEEPALIVE_ALARM = 'cdnwaf-keepalive';
 chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.33 });
 
-// ── A5: Multi-resolver anycast mapping ───────────────────────
+// ── A5 + Round-6: Multi-resolver anycast mapping, extended with
+// DNS-blocking detection, ECS-leak detection, DNSSEC status, and a
+// resolver speed race — all built on the same multi-resolver DoH
+// infrastructure introduced for A5, since they all boil down to
+// "ask several different resolvers the same question and compare."
+//
+// #1 DNS-blocking/censorship detector — compares a "no policy" resolver
+//   (Cloudflare 1.1.1.1) against a resolver that actively filters/blocks
+//   known-bad or policy-restricted domains (OpenDNS FamilyShield). If the
+//   filtering resolver returns a different IP (typically a sinkhole/block
+//   page IP) or NXDOMAIN while the neutral resolver resolves normally,
+//   that's a real signal the domain is blocklisted at the DNS-policy layer
+//   — independent of anycast/CDN routing differences. This is a DIAGNOSTIC
+//   signal only ("is this domain DNS-blocked from this resolver's policy
+//   perspective") — it does not attempt to bypass or route around any
+//   block; it only reports what it observes.
+// #2 EDNS Client Subnet (ECS) leak detector — Google's public DoH resolver
+//   sends part of the querying client's IP as ECS to help authoritative
+//   servers geo-route (documented default behavior); Cloudflare's resolver
+//   does not send ECS by design (their stated privacy policy). If a CDN's
+//   answer differs meaningfully between these two, the CDN is very likely
+//   using ECS to route by client geography — meaning parts of a visitor's
+//   real IP reach that CDN's authoritative DNS layer via ECS, which most
+//   users are unaware of. We only observe and report the differing IP
+//   sets; we never construct or forge an ECS value ourselves.
+// #3 DNSSEC validation status — every DoH JSON response already includes
+//   an "AD" (Authenticated Data) boolean flag per RFC 8484 / the DoH JSON
+//   API convention; we were already fetching this data for A5 and simply
+//   hadn't read this field. No new network cost.
+// #4 Resolver speed race — before running the full multi-resolver
+//   comparison, fire one lightweight query at all resolvers simultaneously
+//   and note which answered first; used to order subsequent lookups by
+//   observed latency in the current session (session-local, not persisted,
+//   since resolver latency varies by network and time of day).
 const ANYCAST_RESOLVERS = [
-  { name: 'Cloudflare', url: 'https://cloudflare-dns.com/dns-query' },
-  { name: 'Google',     url: 'https://dns.google/dns-query' },
-  { name: 'Quad9',      url: 'https://dns.quad9.net/dns-query' },
+  { name: 'Cloudflare', url: 'https://cloudflare-dns.com/dns-query', kind: 'neutral', ecs: false },
+  { name: 'Google',     url: 'https://dns.google/dns-query',         kind: 'neutral', ecs: true  },
+  { name: 'Quad9',      url: 'https://dns.quad9.net/dns-query',      kind: 'security-filtered', ecs: false },
 ];
+// A dedicated "actively filters/blocks by policy" resolver, kept separate
+// from ANYCAST_RESOLVERS since its purpose (policy comparison) is distinct
+// from anycast/geo-routing comparison. OpenDNS FamilyShield resolves
+// blocked domains to a fixed sinkhole IP rather than NXDOMAIN, which is
+// itself a useful, distinct signal from "resolution failed."
+const FILTERING_RESOLVER = { name: 'OpenDNS FamilyShield', url: 'https://doh.familyshield.opendns.com/dns-query' };
+// Known-at-time-of-writing OpenDNS FamilyShield block-page IPs. IMPORTANT —
+// verified via research (real nslookup examples from OpenDNS/Cisco support
+// threads) that this list is NOT guaranteed stable over time, and that
+// FamilyShield's behavior is itself inconsistent: one confirmed example
+// showed a blocked domain correctly sinkholed to 146.112.61.106, while a
+// DIFFERENT blocked domain on the same service returned an unrelated
+// dial-up IP in India instead of any known sinkhole address. Because of
+// this, a sinkhole-IP match is treated as a SECONDARY corroborating hint
+// only — never the primary basis for "blocked: true" — and the UI always
+// shows the "may be outdated" caveat. NXDOMAIN-mismatch (the resolver
+// simply refusing to resolve at all) is the more reliable primary signal,
+// since it doesn't depend on us maintaining an accurate, ever-changing IP list.
+const OPENDNS_SINKHOLE_IPS_LAST_VERIFIED = '2026-07'; // bump when re-checked
+const OPENDNS_SINKHOLE_IPS = new Set(['146.112.61.104', '146.112.61.105', '146.112.61.106', '146.112.61.107', '146.112.61.108', '146.112.61.110']);
+
 async function dohAlt(resolverUrl, domain) {
   try {
     const res = await fetchT(
       `${resolverUrl}?name=${encodeURIComponent(domain)}&type=A`,
       { headers: { Accept: 'application/dns-json' } }, 5000
     );
-    if (!res.ok) return [];
+    if (!res.ok) return { ips: [], ad: false, status: res.status, ok: false };
     const j = await res.json();
-    return (j.Answer || []).filter(r => r.type === 1).map(r => r.data.trim());
-  } catch { return []; }
+    return {
+      ips: (j.Answer || []).filter(r => r.type === 1).map(r => r.data.trim()),
+      ad: j.AD === true, // #3: DNSSEC Authenticated Data flag, already in every DoH response
+      status: j.Status,  // 0 = NOERROR, 3 = NXDOMAIN (RFC 8484 status codes)
+      ok: true,
+    };
+  } catch { return { ips: [], ad: false, status: null, ok: false, error: true }; }
 }
+
 async function anyCastMap(domain) {
-  const rows = await Promise.allSettled(
-    ANYCAST_RESOLVERS.map(r => dohAlt(r.url, domain).then(ips => ({ resolver: r.name, ips })))
+  // #4: race a tiny query against all resolvers first to see who's fastest
+  // this session — informational only, not used to skip any resolver.
+  const raceStart = Date.now();
+  const raceResults = await Promise.allSettled(
+    ANYCAST_RESOLVERS.map(r => dohAlt(r.url, domain).then(res => ({ resolver: r.name, ms: Date.now() - raceStart, res })))
   );
-  const entries = rows.filter(r => r.status === 'fulfilled').map(r => r.value);
+  const timed = raceResults.filter(r => r.status === 'fulfilled').map(r => r.value);
+  timed.sort((a, b) => a.ms - b.ms);
+  const fastestResolver = timed[0]?.resolver || null;
+
+  const entries = timed.map(t => ({ resolver: t.resolver, ips: t.res.ips, ad: t.res.ad, ms: t.ms }));
   const allIps  = [...new Set(entries.flatMap(e => e.ips))];
   const diverges = allIps.length > 1 && entries.some(e =>
     JSON.stringify([...e.ips].sort()) !== JSON.stringify([...entries[0].ips].sort())
   );
-  return { entries, diverges, uniqueIps: allIps };
+
+  // #3: DNSSEC — true only if EVERY resolver that answered set the AD flag
+  // (a single resolver saying AD=true without the others isn't reliable,
+  // since AD reflects that specific resolver's own validation).
+  const dnssecValidated = entries.length > 0 && entries.every(e => e.ad);
+
+  // #2: ECS-leak — compare the ECS-sending resolver (Google) against a
+  // non-ECS resolver (Cloudflare). A meaningfully different IP SET (not
+  // just different order) suggests geo-routing keyed off the ECS-carried
+  // partial client IP.
+  const googleEntry     = entries.find(e => e.resolver === 'Google');
+  const cloudflareEntry = entries.find(e => e.resolver === 'Cloudflare');
+  let ecsLeakSuspected = false;
+  if (googleEntry?.ips.length && cloudflareEntry?.ips.length) {
+    const gSet = new Set(googleEntry.ips);
+    const cSet = new Set(cloudflareEntry.ips);
+    const overlap = [...gSet].filter(ip => cSet.has(ip)).length;
+    ecsLeakSuspected = overlap === 0; // zero overlap = fully different edge set
+  }
+
+  return { entries, diverges, uniqueIps: allIps, dnssecValidated, ecsLeakSuspected, fastestResolver };
+}
+
+// #1: DNS-blocking/censorship detector — diagnostic only, reports what a
+// policy-filtering resolver does differently from a neutral one. Never
+// attempts to route around, bypass, or "fix" a detected block.
+//
+// Cached for 10 minutes per domain — repeated clicks on the same domain
+// (e.g. re-checking after a moment) shouldn't re-fire two DoH round-trips
+// every single time; the underlying DNS state doesn't change that fast.
+const DNS_BLOCK_CACHE_TTL_MS = 10 * 60 * 1000;
+const dnsBlockCache = new Map(); // domain -> { ts, result }
+
+async function checkDnsBlocking(domain) {
+  const cached = dnsBlockCache.get(domain);
+  if (cached && Date.now() - cached.ts < DNS_BLOCK_CACHE_TTL_MS) {
+    return { ...cached.result, fromCache: true };
+  }
+
+  try {
+    const [neutral, filtered] = await Promise.all([
+      dohAlt('https://cloudflare-dns.com/dns-query', domain),
+      dohAlt(FILTERING_RESOLVER.url, domain),
+    ]);
+    if (!neutral.ok || !filtered.ok) {
+      return { checked: false, reason: 'One or both resolvers did not respond' };
+    }
+    const neutralResolved  = neutral.status === 0 && neutral.ips.length > 0;
+    const filteredResolved = filtered.status === 0 && filtered.ips.length > 0;
+    const filteredIsSinkhole = filtered.ips.some(ip => OPENDNS_SINKHOLE_IPS.has(ip));
+
+    let result;
+    if (neutralResolved && !filteredResolved) {
+      // PRIMARY signal: the filtering resolver flatly refuses to resolve
+      // while a neutral one succeeds. This is the more reliable indicator —
+      // it doesn't depend on us knowing every possible sinkhole IP, since
+      // "no answer at all" is unambiguous regardless of what IP scheme
+      // the filtering service currently uses internally.
+      result = {
+        checked: true, blocked: true, basis: 'nxdomain-mismatch', confidence: 'medium-high',
+        detail: `${FILTERING_RESOLVER.name} failed to resolve this domain while a neutral resolver succeeded normally — likely a policy-based DNS block.`,
+      };
+    } else if (neutralResolved && filteredResolved && filteredIsSinkhole) {
+      // SECONDARY corroborating signal only. Research into real-world
+      // FamilyShield behavior found this IP list is not guaranteed current
+      // and the service doesn't always sinkhole consistently, so this is
+      // presented as a weaker, explicitly-caveated hint, not a certainty.
+      result = {
+        checked: true, blocked: true, basis: 'sinkhole-ip-match', confidence: 'low-medium',
+        detail: `${FILTERING_RESOLVER.name} returned an IP (${filtered.ips.join(', ')}) matching a known block-page address as of ${OPENDNS_SINKHOLE_IPS_LAST_VERIFIED} — possible policy block, but this IP list can go stale and isn't a guaranteed match.`,
+      };
+    } else {
+      result = { checked: true, blocked: false, detail: 'No DNS-policy blocking detected between a neutral resolver and a filtering resolver.' };
+    }
+
+    dnsBlockCache.set(domain, { ts: Date.now(), result });
+    return result;
+  } catch (e) {
+    return { checked: false, reason: e.message || 'Lookup failed' };
+  }
 }
 
 // ── A1: HTTPS DNS record (RFC 9460) ──────────────────────────
@@ -1479,62 +1642,69 @@ rangesReady = loadCachedRanges().catch(() => {});
 // Public, free, no auth. Capped to be a good API citizen.
 // Docs: https://check-host.net/about/api
 // ════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+// Distributed probing via check-host.net public API
+// Runs HTTP reachability checks from real servers in ~50 countries and
+// returns per-node latency + HTTP status — reveals whether a domain is
+// reachable/fast from different global vantage points. The public API
+// does NOT expose response headers or a per-node resolved server IP for
+// http checks (verified against https://check-host.net/about/api), so
+// this is latency/reachability intelligence only — it does not attempt
+// to extract CDN signals or confirm anycast from this data source.
+// The extension's own multi-resolver DNS check (A5) remains the source
+// for anycast confirmation.
+// Public, free, no auth required. Capped to be a good API citizen.
+// ════════════════════════════════════════════════════════════════
 const CHECK_HOST_MAX_NODES = 12;
 const CHECK_HOST_POLL_INTERVAL_MS = 2000;
 const CHECK_HOST_MAX_POLLS = 5;
 
-const PROBE_HEADER_PATTERNS = [
-  { name: 'cloudflare',  re: /\bcf-ray\b/i },
-  { name: 'cloudflare',  re: /server:\s*cloudflare\b/i },
-  { name: 'akamai',      re: /\bx-check-cacheable\b/i },
-  { name: 'akamai',      re: /\bakamai-cache-status\b/i },
-  { name: 'fastly',      re: /x-served-by.*cache/i },
-  { name: 'fastly',      re: /\bfastly-/i },
-  { name: 'cloudfront',  re: /\bx-amz-cf-id\b/i },
-  { name: 'azure',       re: /\bx-azure-ref\b/i },
-  { name: 'google',      re: /via:.*google\b/i },
-  { name: 'vercel',      re: /\bx-vercel-id\b/i },
-  { name: 'netlify',     re: /\bx-nf-request-id\b/i },
-  { name: 'imperva',     re: /\bx-iinfo\b/i },
-  { name: 'bunnycdn',    re: /\bbunnycdn-cache\b/i },
-];
-function extractCdnFromHeaders(headersStr) {
-  const detected = new Set();
-  for (const { name, re } of PROBE_HEADER_PATTERNS) if (re.test(headersStr)) detected.add(name);
-  return [...detected];
-}
-function parseProbeHeaders(headersStr) {
-  const lines = (headersStr || '').split(/\r?\n/);
-  const obj = {};
-  for (const line of lines.slice(1)) {
-    const colon = line.indexOf(':');
-    if (colon > 0) {
-      const key = line.slice(0, colon).trim().toLowerCase();
-      const val = line.slice(colon + 1).trim();
-      if (!obj[key]) obj[key] = val;
-    }
-  }
-  return obj;
-}
 async function probeDistributed(domain) {
-  let token, nodes;
+  // NOTE ON API CONTRACT (verified against check-host.net/about/api):
+  //  - The initiating response field is `request_id`, NOT `request_token`.
+  //    Using the wrong field name meant `token` was always undefined —
+  //    that was the root cause of "No request token in response" errors.
+  //  - `check-result/<id>` for an http check returns per-node arrays shaped
+  //    [ok, response_time_seconds, status_message, http_code] — FOUR fields,
+  //    not five. There is no response-headers string and no resolved-IP
+  //    field in this endpoint's result. Earlier code assumed a 5th
+  //    `headersStr` field existed and tried to parse CDN signals /
+  //    X-Real-IP out of it — that data was never actually there, so all
+  //    "cdnSignals"/"resolvedIp" output was silently empty even on success.
+  //    That capability is removed here rather than left fabricating data;
+  //    the node's OWN ip/asn/location (from `nodes`) is real and kept.
+  let requestId, nodes;
   try {
     const init = await fetchT(
       `https://check-host.net/check-http?host=${encodeURIComponent(domain)}&max_nodes=${CHECK_HOST_MAX_NODES}`,
       { headers: { Accept: 'application/json' } }, 10000
     );
-    if (!init.ok) return { error: `check-host.net returned ${init.status}` };
+    if (!init.ok) {
+      // check-host.net returns 403 with an x-deny-reason header for hosts
+      // it refuses (their own abuse-prevention, not something we control).
+      const denyReason = init.headers.get('x-deny-reason');
+      return { error: denyReason ? `check-host.net rejected the request (${denyReason})` : `check-host.net returned HTTP ${init.status}` };
+    }
     const j = await init.json();
-    token = j.request_token;
+    if (j.ok !== 1) return { error: 'check-host.net did not accept the check (ok != 1 in response)' };
+    requestId = j.request_id;
     nodes = j.nodes || {};
-  } catch (e) { return { error: e.message || 'Failed to reach check-host.net' }; }
-  if (!token) return { error: 'No request token in response' };
+  } catch (e) {
+    // Distinguish "network/CORS failure" from other errors where possible —
+    // a TypeError from fetch() with no further detail is the classic
+    // fingerprint of a CORS rejection in a browser/extension context.
+    const isCorsLike = e instanceof TypeError;
+    return { error: isCorsLike
+      ? 'Could not reach check-host.net — this may be blocked by CORS policy or network restrictions in your browser/extension environment.'
+      : (e.message || 'Failed to reach check-host.net') };
+  }
+  if (!requestId) return { error: 'check-host.net response had no request_id' };
 
   let resultData = {};
   for (let poll = 0; poll < CHECK_HOST_MAX_POLLS; poll++) {
     await new Promise(r => setTimeout(r, CHECK_HOST_POLL_INTERVAL_MS));
     try {
-      const res = await fetchT(`https://check-host.net/check-result/${token}`, { headers: { Accept: 'application/json' } }, 8000);
+      const res = await fetchT(`https://check-host.net/check-result/${requestId}`, { headers: { Accept: 'application/json' } }, 8000);
       if (!res.ok) continue;
       resultData = await res.json();
       const pending = Object.values(resultData).filter(v => v === null).length;
@@ -1544,34 +1714,33 @@ async function probeDistributed(domain) {
 
   const nodeResults = [];
   for (const [nodeId, result] of Object.entries(resultData)) {
-    const nodeInfo = nodes[nodeId];
+    const nodeInfo = nodes[nodeId]; // [country_code, country_name, city, node_ip, asn]
     if (!nodeInfo) continue;
-    const [, countryCode, city, countryName] = nodeInfo;
+    const [countryCode, countryName, city, nodeIp, asn] = nodeInfo;
+
     if (!result || !result[0]) {
-      nodeResults.push({ nodeId, country: countryName || countryCode, city, status: 'pending' });
+      nodeResults.push({ nodeId, country: countryName || countryCode, city, nodeIp, asn, status: 'pending' });
       continue;
     }
-    const [connectCode, , httpCode, headersStr, latency] = result[0];
-    const parsedHeaders = parseProbeHeaders(headersStr || '');
+    // Real shape: [ok(1|0), response_time_seconds, status_message, http_code]
+    const [ok, responseTimeSec, statusMessage, httpCode] = result[0];
     nodeResults.push({
-      nodeId, country: countryName || countryCode, city,
-      status: connectCode === 1 ? 'ok' : 'fail',
-      httpCode, latencyMs: latency ? Math.round(latency * 1000) : null,
-      cdnSignals: extractCdnFromHeaders(headersStr || ''),
-      resolvedIp: parsedHeaders['x-real-ip'] || null,
-      serverHeader: parsedHeaders['server'] || null,
-      cacheHeader: parsedHeaders['cf-cache-status'] || parsedHeaders['x-cache'] || null,
+      nodeId, country: countryName || countryCode, city, nodeIp, asn,
+      status: ok === 1 ? 'ok' : 'fail',
+      httpCode: httpCode ?? null,
+      statusMessage: statusMessage || null,
+      latencyMs: typeof responseTimeSec === 'number' ? Math.round(responseTimeSec * 1000) : null,
     });
   }
 
-  const uniqueIps = [...new Set(nodeResults.filter(r => r.resolvedIp).map(r => r.resolvedIp))];
   return {
     domain, nodeResults,
-    uniqueEdgeIps: uniqueIps,
-    anycastConfirmed: uniqueIps.length > 1,
-    cdnSignalsSeen: [...new Set(nodeResults.flatMap(r => r.cdnSignals || []))],
     totalNodes: nodeResults.length,
     okNodes: nodeResults.filter(r => r.status === 'ok').length,
+    // Anycast/CDN-signal detection via this API is not possible — see note
+    // above. The extension's own DNS-based anycast check (A5, multi-resolver)
+    // remains the reliable source for that; this probe is latency/reachability
+    // intelligence from real global vantage points, nothing more.
   };
 }
 
@@ -1593,6 +1762,254 @@ async function queryASN(ip) {
     };
     asnCache.set(ip, result);
     return result;
+  } catch { return null; }
+}
+
+// ════════════════════════════════════════════════════════════════
+// Round-5: net-new ideas (#3, #4, #5, #7, #8, #9, #10, #11)
+// #1 (JA4H) and #2 (passive TCP timing) were dropped after research —
+// both measure the CLIENT's fingerprint as seen by a server, which is
+// backwards for what this extension does (it IS the client). Browser JS
+// also has no access to raw TCP/HTTP2-frame data (SETTINGS, WINDOW_UPDATE,
+// PRIORITY) — that requires packet capture, outside what fetch() exposes.
+// No safe/valid substitute exists inside a browser extension's JS sandbox,
+// so both are omitted rather than faked.
+// ════════════════════════════════════════════════════════════════
+
+// ── #3: RUM-style Core Web Vitals, correlated with detected provider ──
+// Stored locally, aggregated over time, to answer "is my Cloudflare setup
+// actually faster than my old Fastly setup" using the person's OWN
+// browsing data — not a synthetic benchmark claim.
+const RUM_STORAGE_KEY = 'rum_vitals_by_provider';
+const MAX_RUM_SAMPLES_PER_PROVIDER = 200;
+
+async function recordRumSample(providerIds, vitals) {
+  if (!providerIds?.length || !vitals) return;
+  try {
+    const { [RUM_STORAGE_KEY]: store = {} } = await chrome.storage.local.get(RUM_STORAGE_KEY);
+    for (const pid of providerIds) {
+      const arr = store[pid] || [];
+      arr.unshift({ ts: Date.now(), ...vitals });
+      store[pid] = arr.slice(0, MAX_RUM_SAMPLES_PER_PROVIDER);
+    }
+    await chrome.storage.local.set({ [RUM_STORAGE_KEY]: store });
+  } catch {}
+}
+async function getRumSummary() {
+  try {
+    const { [RUM_STORAGE_KEY]: store = {} } = await chrome.storage.local.get(RUM_STORAGE_KEY);
+    const summary = {};
+    for (const [pid, samples] of Object.entries(store)) {
+      if (!samples.length) continue;
+      const avg = key => {
+        const vals = samples.map(s => s[key]).filter(v => typeof v === 'number');
+        return vals.length ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length) : null;
+      };
+      const median = key => {
+        const vals = samples.map(s => s[key]).filter(v => typeof v === 'number').sort((a, b) => a - b);
+        if (!vals.length) return null;
+        return vals[Math.floor(vals.length / 2)];
+      };
+      summary[pid] = {
+        sampleCount: samples.length,
+        avgLCP: avg('lcp'), avgINP: avg('inp'), avgCLS: avg('cls'), avgTTFB: avg('ttfb'),
+        medianLCP: median('lcp'), medianTTFB: median('ttfb'),
+      };
+    }
+    return summary;
+  } catch { return {}; }
+}
+
+// ── #4: Third-party script waterfall attribution ──────────────
+// Classifies PerformanceResourceTiming entries into "same as detected CDN"
+// vs "unrelated third party" (analytics, ads, fonts, trackers) so people
+// can see how much load time is actually caused by non-CDN third parties.
+const KNOWN_THIRD_PARTY_CATEGORIES = [
+  { re: /google-analytics\.com|googletagmanager\.com|analytics\.google\.com/, category: 'Analytics', name: 'Google Analytics/Tag Manager' },
+  { re: /doubleclick\.net|googlesyndication\.com|adservice\.google/, category: 'Ads', name: 'Google Ads' },
+  { re: /facebook\.net|connect\.facebook\.com/, category: 'Social/Tracking', name: 'Facebook Pixel' },
+  { re: /hotjar\.com/, category: 'Analytics', name: 'Hotjar' },
+  { re: /segment\.(io|com)/, category: 'Analytics', name: 'Segment' },
+  { re: /intercom\.io/, category: 'Chat/Support', name: 'Intercom' },
+  { re: /fonts\.googleapis\.com|fonts\.gstatic\.com/, category: 'Fonts', name: 'Google Fonts' },
+  { re: /cdn\.jsdelivr\.net|unpkg\.com|cdnjs\.cloudflare\.com/, category: 'Library CDN', name: 'Public library CDN' },
+  { re: /stripe\.com|js\.stripe\.com/, category: 'Payments', name: 'Stripe' },
+  { re: /recaptcha\.net|gstatic\.com\/recaptcha/, category: 'Bot check', name: 'reCAPTCHA' },
+  { re: /sentry\.io/, category: 'Error tracking', name: 'Sentry' },
+  { re: /clarity\.ms/, category: 'Analytics', name: 'Microsoft Clarity' },
+  { re: /tiktok\.com\/i18n|analytics\.tiktok\.com/, category: 'Social/Tracking', name: 'TikTok Pixel' },
+];
+function classifyThirdPartyEntries(entries, mainDomain) {
+  const buckets = {};
+  let mainDomainTime = 0, thirdPartyTime = 0;
+  for (const e of entries) {
+    let host;
+    try { host = new URL(e.name).hostname; } catch { continue; }
+    const duration = e.responseEnd - e.startTime;
+    if (host === mainDomain || host.endsWith(`.${mainDomain}`)) {
+      mainDomainTime += duration;
+      continue;
+    }
+    const match = KNOWN_THIRD_PARTY_CATEGORIES.find(c => c.re.test(host));
+    const category = match?.category || 'Other third-party';
+    const name = match?.name || host;
+    if (!buckets[category]) buckets[category] = { category, items: {}, totalMs: 0 };
+    buckets[category].items[name] = (buckets[category].items[name] || 0) + duration;
+    buckets[category].totalMs += duration;
+    thirdPartyTime += duration;
+  }
+  return {
+    mainDomainTimeMs: Math.round(mainDomainTime),
+    thirdPartyTimeMs: Math.round(thirdPartyTime),
+    thirdPartyPct: (mainDomainTime + thirdPartyTime) > 0
+      ? Math.round((thirdPartyTime / (mainDomainTime + thirdPartyTime)) * 100) : 0,
+    buckets: Object.values(buckets).sort((a, b) => b.totalMs - a.totalMs),
+  };
+}
+
+// ── #5: CDN "service tier" heuristic ───────────────────────────
+// Not a claim about actual billing plan — purely inferred from feature
+// signals that correlate with paid tiers on major CDNs. Framed as a
+// heuristic, never as a fact, in both the code and the UI text.
+function inferServiceTier(providerId, signals, headers) {
+  const h = name => headers?.[name.toLowerCase()] || '';
+  const indicators = [];
+  let tierScore = 0;
+
+  if (providerId === 'cloudflare') {
+    if (/webp|avif/i.test(h('content-type')) && signals.imageOptimization) { indicators.push('Image optimization (Polish) active'); tierScore += 2; }
+    if (h('cf-cache-status') === 'DYNAMIC' && signals.argoDetected) { indicators.push('Argo Smart Routing hints'); tierScore += 2; }
+    if (signals.wafRulesActive) { indicators.push('Custom WAF rules active'); tierScore += 1; }
+  }
+  if (providerId === 'fastly') {
+    if (signals.imageOptimization) { indicators.push('Fastly Image Optimizer active'); tierScore += 2; }
+  }
+  if (providerId === 'akamai') {
+    if (signals.imageManager) { indicators.push('Akamai Image & Video Manager'); tierScore += 2; }
+  }
+
+  const tier = tierScore >= 3 ? 'Likely paid/enterprise tier' : tierScore >= 1 ? 'Possibly upgraded tier' : 'Insufficient signal';
+  return { tier, indicators, tierScore, disclaimer: 'Heuristic only — inferred from optional features, not actual billing data.' };
+}
+
+// ── #7: well-known files OSINT (robots.txt, security.txt) ─────
+async function probeWellKnownFiles(domain) {
+  const out = { robotsTxt: null, securityTxt: null, findings: [] };
+  try {
+    const res = await fetchT(`https://${domain}/robots.txt`, {}, 6000);
+    if (res.ok) {
+      const text = await res.text();
+      out.robotsTxt = { status: res.status, length: text.length, snippet: text.slice(0, 500) };
+      // Look for CDN-injected comments (some CDNs stamp cache metadata as comments)
+      const cdnComment = text.match(/^#.*\b(cloudflare|akamai|fastly|cloudfront)\b.*/im);
+      if (cdnComment) out.findings.push(`robots.txt comment mentions: ${cdnComment[0].slice(0, 120)}`);
+      // Sitemap references can reveal additional subdomains
+      const sitemaps = [...text.matchAll(/^Sitemap:\s*(\S+)/gim)].map(m => m[1]);
+      if (sitemaps.length) out.findings.push(`${sitemaps.length} sitemap reference(s) found`);
+    }
+  } catch {}
+  try {
+    const paths = [`/.well-known/security.txt`, `/security.txt`];
+    for (const p of paths) {
+      const res = await fetchT(`https://${domain}${p}`, {}, 6000);
+      if (res.ok) {
+        const text = await res.text();
+        out.securityTxt = { path: p, length: text.length, snippet: text.slice(0, 500) };
+        const bugBounty = text.match(/^Policy:\s*(\S+)/im) || text.match(/^Hiring:\s*(\S+)/im);
+        if (bugBounty) out.findings.push(`security.txt references: ${bugBounty[0]}`);
+        break;
+      }
+    }
+  } catch {}
+  return out;
+}
+
+// ── #8: "Blast radius" — other domains sharing the same IP ─────
+// Uses Shodan InternetDB (free, no key) reverse-hostname info when present;
+// falls back to a note that full reverse-IP lookup needs a paid service.
+async function checkBlastRadius(ip) {
+  try {
+    const res = await fetchT(`https://internetdb.shodan.io/${encodeURIComponent(ip)}`, {}, 8000);
+    if (!res.ok) return { ip, hostnames: [], note: 'InternetDB lookup failed' };
+    const data = await res.json();
+    return {
+      ip,
+      hostnames: data.hostnames || [],
+      note: (data.hostnames || []).length > 1
+        ? `${data.hostnames.length} hostnames share this IP — likely shared hosting/CDN edge, not necessarily related sites`
+        : 'No additional hostnames found via free lookup (full reverse-IP databases may know more)',
+    };
+  } catch (e) { return { ip, hostnames: [], note: e.message }; }
+}
+
+// ── #9: CDN status-page correlation ────────────────────────────
+// When a watchlist diff looks like a provider change, check whether that
+// provider is having a known outage — avoids false "they migrated!" alarms
+// when it's really "Cloudflare is down right now".
+const CDN_STATUS_PAGES = {
+  cloudflare: 'https://www.cloudflarestatus.com/api/v2/status.json',
+  fastly:     'https://status.fastly.com/api/v2/status.json',
+  akamai:     'https://www.akamaistatus.com/api/v2/status.json',
+  vercel:     'https://www.vercel-status.com/api/v2/status.json',
+  netlify:    'https://www.netlifystatus.com/api/v2/status.json',
+  google:     'https://status.cloud.google.com/incidents.json',
+};
+async function checkProviderStatus(providerId) {
+  const url = CDN_STATUS_PAGES[providerId];
+  if (!url) return null;
+  try {
+    const res = await fetchT(url, {}, 6000);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.status) { // Statuspage.io format
+      return { indicator: data.status.indicator, description: data.status.description };
+    }
+    if (Array.isArray(data)) { // Google Cloud incidents format
+      const active = data.filter(i => !i.end);
+      return { indicator: active.length ? 'incident' : 'none', description: active[0]?.external_desc || 'No active incidents' };
+    }
+    return null;
+  } catch { return null; }
+}
+
+// ── #10: Shareable "infrastructure fingerprint" string ─────────
+// A compact, JA4-style human-readable string summarizing the whole scan —
+// meant to be pasted in chat/tickets for quick comparison, not a security
+// hash. Format: CDNW1_<providers>_<dns>_<ech><anycast>_<layers>
+function buildFingerprintString(result) {
+  const detected = Object.entries(result.providers || {})
+    .filter(([, v]) => v.verdict?.detected)
+    .sort((a, b) => b[1].verdict.score - a[1].verdict.score)
+    .map(([id]) => id.slice(0, 4)).join('.');
+  const dns = result.dnsProvider ? result.dnsProvider.replace(/[^a-zA-Z0-9]/g, '').slice(0, 6).toLowerCase() : 'unk';
+  const ech = result.httpsRecord?.ech ? 'e1' : 'e0';
+  const any = result.anycast?.diverges ? 'a1' : 'a0';
+  const layers = result.layerChain?.chain?.length || 0;
+  return `CDNW1_${detected || 'none'}_${dns}_${ech}${any}_L${layers}`;
+}
+
+// ── #11: Wayback Machine historical cross-check ────────────────
+// Queries the CDX API (public, free, no key) to see how far back archive.org
+// has snapshots for this domain — useful context for how long infrastructure
+// has been observable, well beyond this extension's own local history.
+async function queryWaybackHistory(domain) {
+  try {
+    const res = await fetchT(
+      `https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(domain)}&output=json&limit=5&from=1996&collapse=timestamp:4`,
+      {}, 8000
+    );
+    if (!res.ok) return null;
+    const rows = await res.json();
+    if (!Array.isArray(rows) || rows.length < 2) return null; // first row is the header
+    const dataRows = rows.slice(1);
+    const first = dataRows[0];
+    const timestamps = dataRows.map(r => r[1]);
+    return {
+      firstSnapshot: first[1], // YYYYMMDDhhmmss
+      totalSnapshotsSampled: dataRows.length,
+      earliestYear: first[1]?.slice(0, 4),
+      sampleTimestamps: timestamps,
+    };
   } catch { return null; }
 }
 
@@ -1680,6 +2097,14 @@ chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
     })().then(r => sendResponse(r)).catch(e => sendResponse({ error: e.message, findings: [] }));
     return true;
   }
+  // #1: DNS-blocking/censorship check — on-demand, not run on every scan
+  // (extra network round-trips to a second resolver aren't worth paying
+  // for domains that clearly aren't blocked).
+  if (msg.action === 'checkDnsBlocking') {
+    checkDnsBlocking(msg.domain).then(r => sendResponse(r))
+      .catch(e => sendResponse({ checked: false, reason: e.message }));
+    return true;
+  }
   if (msg.action === 'getSettings') {
     getSettings().then(s => sendResponse(s));
     return true;
@@ -1748,6 +2173,11 @@ chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
     injectAndGetTimingData(msg.tabId).then(data => sendResponse({ data }));
     return true;
   }
+  // #3/#4: Core Web Vitals + resource waterfall from active tab
+  if (msg.action === 'getVitalsAndWaterfall') {
+    injectAndGetVitals(msg.tabId).then(data => sendResponse({ data }));
+    return true;
+  }
   // D1: Full snapshot for infrastructure-diff timeline
   if (msg.action === 'getSnapshotHistory') {
     getSnapshotHistory(msg.domain).then(list => sendResponse({ snapshots: list }));
@@ -1768,6 +2198,59 @@ chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
   // ASN/org lookup for a specific IP
   if (msg.action === 'queryASN') {
     queryASN(msg.ip).then(r => sendResponse({ data: r }));
+    return true;
+  }
+  // #3: RUM Core Web Vitals summary per provider
+  if (msg.action === 'getRumSummary') {
+    getRumSummary().then(summary => sendResponse({ summary }));
+    return true;
+  }
+  if (msg.action === 'recordRumSample') {
+    recordRumSample(msg.providerIds, msg.vitals).then(() => sendResponse({ ok: true }));
+    return true;
+  }
+  // #4: Third-party waterfall attribution (entries collected client-side, classified here)
+  if (msg.action === 'classifyThirdParty') {
+    try {
+      const result = classifyThirdPartyEntries(msg.entries || [], msg.mainDomain || '');
+      sendResponse({ result });
+    } catch (e) { sendResponse({ error: e.message }); }
+    return true;
+  }
+  // #5: CDN service-tier heuristic
+  if (msg.action === 'inferServiceTier') {
+    try {
+      const result = inferServiceTier(msg.providerId, msg.signals || {}, msg.headers || {});
+      sendResponse({ result });
+    } catch (e) { sendResponse({ error: e.message }); }
+    return true;
+  }
+  // #7: well-known files OSINT (robots.txt, security.txt)
+  if (msg.action === 'probeWellKnownFiles') {
+    probeWellKnownFiles(msg.domain).then(r => sendResponse(r))
+      .catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+  // #8: Blast radius — other hostnames sharing this IP
+  if (msg.action === 'checkBlastRadius') {
+    checkBlastRadius(msg.ip).then(r => sendResponse(r))
+      .catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+  // #9: CDN provider status-page check
+  if (msg.action === 'checkProviderStatus') {
+    checkProviderStatus(msg.providerId).then(r => sendResponse({ status: r }));
+    return true;
+  }
+  // #10: Shareable infrastructure fingerprint string
+  if (msg.action === 'buildFingerprint') {
+    try { sendResponse({ fingerprint: buildFingerprintString(msg.result) }); }
+    catch (e) { sendResponse({ error: e.message }); }
+    return true;
+  }
+  // #11: Wayback Machine historical cross-check
+  if (msg.action === 'queryWaybackHistory') {
+    queryWaybackHistory(msg.domain).then(r => sendResponse({ data: r }));
     return true;
   }
   // Clipboard scan: background receives domain from popup clipboard button
@@ -1824,7 +2307,13 @@ chrome.commands.onCommand.addListener(async (command) => {
   if (command === 'open-side-panel') {
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (tab?.windowId != null) await chrome.sidePanel.open({ windowId: tab.windowId });
+      if (chrome.sidePanel?.open) {
+        // Chrome: side panel API
+        if (tab?.windowId != null) await chrome.sidePanel.open({ windowId: tab.windowId });
+      } else if (chrome.sidebarAction?.toggle) {
+        // Firefox: sidebar_action is the equivalent persistent side UI
+        await chrome.sidebarAction.toggle();
+      }
     } catch {}
   }
   if (command === 'scan-clipboard') {
@@ -2069,6 +2558,48 @@ async function injectAndGetTimingData(tabId) {
           domainLookupTime: (nav.domainLookupEnd - nav.domainLookupStart) || null,
           connectTime: (nav.connectEnd - nav.connectStart) || null,
           ttfb: (nav.responseStart - nav.requestStart) || null,
+        };
+      },
+    });
+    return results?.[0]?.result || null;
+  } catch { return null; }
+}
+
+// ── #3/#4: Core Web Vitals + resource waterfall from the active tab ──
+// Reads already-buffered PerformanceObserver entries (buffered: true means
+// entries recorded before this injection still get captured retroactively,
+// as long as the page hasn't fully cleared its performance timeline).
+// Vitals are approximate (best-effort from buffered entries, not a live
+// observer attached from page load) — good enough for local trend tracking,
+// not claimed as lab-precise measurement.
+async function injectAndGetVitals(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const nav = performance.getEntriesByType('navigation')[0] || {};
+        const ttfb = (nav.responseStart - nav.requestStart) || null;
+
+        let lcp = null;
+        try {
+          const lcpEntries = performance.getEntriesByType('largest-contentful-paint');
+          if (lcpEntries.length) lcp = lcpEntries[lcpEntries.length - 1].renderTime || lcpEntries[lcpEntries.length - 1].loadTime || null;
+        } catch {}
+
+        let cls = 0;
+        try {
+          const clsEntries = performance.getEntriesByType('layout-shift');
+          for (const e of clsEntries) if (!e.hadRecentInput) cls += e.value;
+        } catch {}
+
+        const resourceEntries = performance.getEntriesByType('resource').map(e => ({
+          name: e.name, startTime: e.startTime, responseEnd: e.responseEnd,
+        }));
+
+        return {
+          vitals: { lcp, cls: Math.round(cls * 1000) / 1000, ttfb },
+          resourceEntries: resourceEntries.slice(0, 300), // cap payload size
+          mainDomain: location.hostname,
         };
       },
     });

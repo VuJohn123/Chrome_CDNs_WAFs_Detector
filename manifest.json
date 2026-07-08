@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "__MSG_extName__",
-  "version": "9.1.0",
-  "description": "__MSG_extDescription__",
+  "version": "9.4.5",
+  "description": "Detect 24 CDN/WAF/Bot-Management/edge-hosting providers via domain or direct IP scan \u2014 with passive ambient detection, watchlists synced across devices, distributed global probing, Core Web Vitals attribution, and hardened scoring against false-positive corroboration.",
   "minimum_chrome_version": "114",
   "default_locale": "en",
   "permissions": [
