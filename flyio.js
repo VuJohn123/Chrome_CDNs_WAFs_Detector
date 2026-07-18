@@ -15,6 +15,12 @@
 self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'flyio', name: 'Fly.io', color: '#8b5cf6', icon: '🪰',
+
+  knownHeaders: [
+    'fly-forwarded-port',
+    'fly-region',
+    'fly-request-id',
+  ],
   productType: 'Edge compute / app hosting (not a traditional CDN)',
 
   freshSignals: () => ({

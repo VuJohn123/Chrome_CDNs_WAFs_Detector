@@ -15,6 +15,13 @@
 self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'tencenteo', name: 'Tencent EdgeOne', color: '#00a4ff', icon: '🐧',
+
+  knownHeaders: [
+    'eo-cache-status',
+    'eo-client-device',
+    'eo-connecting-ip',
+    'eo-log-uuid',
+  ],
   ipConfig: null, // Tencent does not publish a single consolidated public EdgeOne IP list
 
   freshSignals: () => ({

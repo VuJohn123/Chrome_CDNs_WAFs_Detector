@@ -1,23 +1,45 @@
-// Azure CDN / Front Door Provider  v7.3
+// Azure CDN / Front Door Provider  v7.4
 // 2026 updates:
-//  • X-Azure-JA4-Fingerprint — new official AFD header (JA4 TLS fingerprint, 2025 docs)
 //  • X-Azure-RequestChain hops= format confirmed stable in 2026 AFD docs
 //  • AFD classic (CDN legacy) retired Aug 2025; NS/CNAME detection remains valid
 //  • X-Azure-Ref: both old base64 and new timestamp formats accepted
 //  • Azure Front Door switched from Anycast → Unicast routing (Mar–Apr 2026)
 //  • X-Azure-DebugInfo probe still functional when sent as request header
+//  • v7.4 (research-corrected): removed X-Azure-JA4-Fingerprint check. Verified
+//    against Microsoft's own Front Door HTTP headers documentation
+//    (MicrosoftDocs/azure-docs) that this header is attached to the request
+//    Front Door forwards to the ORIGIN server, not to the response sent back
+//    to the client — a browser extension reading fetch() responses can never
+//    observe it. The previous version silently carried this as always-false
+//    dead code contributing a 48-point weight that could never actually fire.
 
 self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'azure', name: 'Azure', color: '#0078d4', icon: '🔷',
+
+  knownHeaders: [
+    'x-azure-externalerror',
+    'x-azure-fdid',
+    'x-azure-internalerror',
+    'x-azure-originstatus',
+    'x-azure-ref',
+    'x-azure-requestchain',
+    'x-ms-access-tier',
+    'x-ms-activity-id',
+    'x-ms-blob-type',
+    'x-ms-client-request-id',
+    'x-ms-creation-time',
+    'x-ms-request-id',
+    'x-ms-routing-name',
+    'x-ms-server-encrypted',
+    'x-ms-version',
+  ],
 
   freshSignals: () => ({
     azureCname: false, azureTrafficMgr: false,
     xAzureRefValid: false, xAzureRef: false,
     xAzureFdidValid: false, xAzureFdid: false,
     viaAzure: false, xAzureRequestChain: false, xAzureCacheHit: false,
-    // New 2026: JA4 fingerprint header
-    xAzureJa4: false,
     xMsRoutingName: false, xMsRequestId: false, xMsVersion: false,
     xMsClientRequestId: false, xMsActivityId: false, xMsEdge: false,
     serverAzureStorage: false, xMsBlobType: false, xMsAccessTier: false,
@@ -65,9 +87,14 @@ self.CDN_PROVIDERS.push({
         /azure/i.test(hR('x-cache')))
                                                                     s.xAzureCacheHit    = true;
 
-    // NEW 2026: X-Azure-JA4-Fingerprint — TLS client hello fingerprint
-    // Added to AFD per official 2025 documentation for bot/anomaly detection
-    if (res.headers.has('x-azure-ja4-fingerprint'))                 s.xAzureJa4         = true;
+    // NOTE: X-Azure-JA4-Fingerprint was previously checked here, but research
+    // against Microsoft's own Front Door documentation confirmed this header
+    // is added to the OUTGOING request Front Door sends to the origin/backend
+    // server — it is never returned in the response a client receives. A
+    // browser extension can only read response headers via fetch(), so this
+    // check could never fire and was silently inflating confidence with a
+    // signal that was structurally impossible to observe. Removed rather
+    // than left as always-false dead weight.
 
     // X-MS-* family headers
     if (res.headers.has('x-ms-routing-name'))                       s.xMsRoutingName     = true;
@@ -126,7 +153,6 @@ self.CDN_PROVIDERS.push({
     let n = 0;
     if (s.xAzureRefValid)     n += 55;
     if (s.xAzureFdidValid)    n += 52;
-    if (s.xAzureJa4)          n += 48; // New 2026 — exclusive to AFD
     if (s.azureCname)         n += 42;
     if (s.xAzureRequestChain) n += 38;
     if (s.viaAzure)           n += 36;

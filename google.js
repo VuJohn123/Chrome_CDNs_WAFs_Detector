@@ -11,6 +11,23 @@ self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'google', name: 'Google', color: '#4285f4', icon: '🔵',
 
+  knownHeaders: [
+    'google-cloud-trace',
+    'x-appengine-city',
+    'x-appengine-country',
+    'x-cloud-trace-context',
+    'x-firebase',
+    'x-gfe-request-stage',
+    'x-goog-expiration',
+    'x-goog-generation',
+    'x-goog-hash',
+    'x-goog-stored-content-encoding',
+    'x-google-backends',
+    'x-google-cache-control',
+    'x-google-gfe-request-stage',
+    'x-guploader-uploadid',
+  ],
+
   ipConfig: {
     ipSignal: 'googleIP', storageKey: 'ip_google',
     v4Url: 'https://www.gstatic.com/ipranges/goog.json', singleFile: true,

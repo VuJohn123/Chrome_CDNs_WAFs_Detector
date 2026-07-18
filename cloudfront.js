@@ -14,6 +14,19 @@ self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'cloudfront', name: 'CloudFront', color: '#ff9900', icon: '☁',
 
+  knownHeaders: [
+    'x-amz-bucket-region',
+    'x-amz-cf-id',
+    'x-amz-cf-pop',
+    'x-amz-delete-marker',
+    'x-amz-id-2',
+    'x-amz-storage-class',
+    'x-amz-version-id',
+    'x-amzn-requestid',
+    'x-amzn-trace-id',
+    'x-amzn-waf-action',
+  ],
+
   ipConfig: {
     ipSignal: 'cloudfrontIP', storageKey: 'ip_cf_aws',
     v4Url: 'https://ip-ranges.amazonaws.com/ip-ranges.json',

@@ -14,6 +14,11 @@
 self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'alicdn', name: 'Alibaba Cloud CDN', color: '#ff6a00', icon: '🅰',
+
+  knownHeaders: [
+    'x-swift-cachetime',
+    'x-swift-savetime',
+  ],
   ipConfig: null, // Alibaba Cloud CDN IP ranges are not published as a single static list
 
   freshSignals: () => ({

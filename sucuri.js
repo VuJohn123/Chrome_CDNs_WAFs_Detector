@@ -11,6 +11,14 @@
 self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'sucuri', name: 'Sucuri', color: '#e77b30', icon: '🔒',
+
+  knownHeaders: [
+    'x-sucuri-cache',
+    'x-sucuri-country',
+    'x-sucuri-generated-time',
+    'x-sucuri-id',
+    'x-sucuri-version',
+  ],
   ipConfig: null,
 
   freshSignals: () => ({

@@ -11,6 +11,24 @@ self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'akamai', name: 'Akamai', color: '#009bde', icon: '🌊',
 
+  knownHeaders: [
+    'akamai-cache-status',
+    'akamai-ew-trace',
+    'akamai-grn',
+    'akamai-origin-hop',
+    'edge-cache-tag',
+    'x-akamai-edgescape',
+    'x-akamai-edgeworker-trace',
+    'x-akamai-request-id',
+    'x-akamai-session-info',
+    'x-akamai-ssl-client-sid',
+    'x-akamai-staging',
+    'x-akamai-transformed',
+    'x-check-cacheable',
+    'x-serial',
+    'x-true-cache-key',
+  ],
+
   freshSignals: () => ({
     akamaiCname: false,
     serverAkamai: false, xAkamaiTransformed: false, xAkamaiRequestId: false,

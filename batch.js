@@ -13,6 +13,16 @@ const exportJsonBtn = document.getElementById('exportJsonBtn');
 const exportCsvBtn  = document.getElementById('exportCsvBtn');
 
 const CONCURRENCY = 3;
+
+// #7: pick up domains handed off from the "batch from bookmarks/tabs" flow
+chrome.storage.local.get('batch_prefill_domains', res => {
+  const domains = res?.batch_prefill_domains;
+  if (domains?.length) {
+    chrome.storage.local.remove('batch_prefill_domains');
+    domainListEl.value = domains.join('\n');
+  }
+});
+
 let lastResults = [];   // [{domain, result}]
 let scanAborted = false;
 

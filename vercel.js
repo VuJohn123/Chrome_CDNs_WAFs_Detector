@@ -11,6 +11,26 @@
 self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'vercel', name: 'Vercel', color: '#e2e8f0', icon: '▲',
+
+  knownHeaders: [
+    'x-deployment-id',
+    'x-matched-path',
+    'x-middleware-invoke',
+    'x-middleware-rewrite',
+    'x-next-cache-tags',
+    'x-nextjs-cache',
+    'x-nextjs-prerender',
+    'x-nextjs-stale-time',
+    'x-vercel-cache',
+    'x-vercel-challenge',
+    'x-vercel-error',
+    'x-vercel-execution-region',
+    'x-vercel-id',
+    'x-vercel-ip-country',
+    'x-vercel-proxy-signature',
+    'x-vercel-sk',
+    'x-vercel-waf-action',
+  ],
   ipConfig: null,
 
   freshSignals: () => ({
@@ -29,6 +49,11 @@ self.CDN_PROVIDERS.push({
     xVercelIpCountry: false,
     // 2026: Bot Protection challenge header
     xVercelChallenge: false,
+    // v7.4: proxy-signature header — present when Vercel acts as a rewrite
+    // proxy (confirmed via Vercel/Next.js team GitHub discussion; used for
+    // request verification on rewrites, not officially documented but
+    // observed consistently in production)
+    xVercelProxySignature: false,
     dnsShortTtl: false, dnsVeryShortTtl: false, timingAnomaly: false,
     meta: { vercelId: null, region: null, deploymentId: null }
   }),
@@ -73,6 +98,7 @@ self.CDN_PROVIDERS.push({
     if (res.headers.has('x-vercel-waf-action'))         s.xVercelWafAction  = true;
     if (/^[A-Z]{2}$/i.test(hR('x-vercel-ip-country').trim())) s.xVercelIpCountry = true;
     if (res.headers.has('x-vercel-challenge'))          s.xVercelChallenge  = true;
+    if (res.headers.has('x-vercel-proxy-signature'))    s.xVercelProxySignature = true;
   },
 
   probes: [],
@@ -112,6 +138,7 @@ self.CDN_PROVIDERS.push({
     if (s.xVercelExecRegion)    n += 10;
     if (s.xVercelWafAction)     n += 16; // Vercel Firewall active
     if (s.xVercelChallenge)     n += 14;
+    if (s.xVercelProxySignature) n += 16;
     if (s.xVercelIpCountry)     n += 8;
     if (s.dnsVeryShortTtl && n >= 30) n += 8; // Vercel commonly uses 60s TTL
     if (s.ipEvidenceMatch) n += 10; // Independent PTR/RDAP corroborator

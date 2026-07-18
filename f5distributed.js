@@ -14,6 +14,10 @@
 self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'f5xc', name: 'F5 Distributed Cloud', color: '#e4002b', icon: '🟥',
+
+  knownHeaders: [
+    'x-cache-status','x-request-id','x-volterra-',
+  ],
   ipConfig: null, // F5 XC does not publish a consolidated public IP range list
 
   freshSignals: () => ({

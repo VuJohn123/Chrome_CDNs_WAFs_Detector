@@ -10,6 +10,20 @@
 self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'netlify', name: 'Netlify', color: '#00c7b7', icon: '💠',
+
+  knownHeaders: [
+    'netlify-cdn-cache-control',
+    'netlify-server-timing',
+    'netlify-vary',
+    'x-netlify-cache',
+    'x-netlify-original-path',
+    'x-netlify-rewrite',
+    'x-nf-edge-cache',
+    'x-nf-edge-functions',
+    'x-nf-origin-cache',
+    'x-nf-pop',
+    'x-nf-request-id',
+  ],
   ipConfig: null,
 
   freshSignals: () => ({

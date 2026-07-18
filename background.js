@@ -709,7 +709,7 @@ async function checkOriginLeak(domain, knownProviderRanges) {
 
 // ── Shared common-header extraction ──────────────────────────
 // Called once per HTTP response; result is merged into every provider's signals.
-function extractCommonSignals(res) {
+function extractCommonSignals(res, domain) {
   const hR = n => res.headers.get(n) || '';
   const h  = n => hR(n).toLowerCase();
 
@@ -733,6 +733,9 @@ function extractCommonSignals(res) {
     viaHeader:            hR('via'),
     // X-Cache (generic; providers check for provider-specific values)
     xCacheHeader:         hR('x-cache'),
+    // Regex-escaped domain — for providers matching domain-specific patterns
+    // in response bodies (e.g. Imperva's "?d=<domain>" challenge param).
+    _domainEscaped:       domain ? domain.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : '',
   };
 }
 
@@ -899,6 +902,7 @@ async function performScan(domain, progress) {
       : [`https://${domain}`, `https://www.${domain}`];
   const timings    = [];
   let   lastFinalUrl = null;
+  let   lastResponseHeaderNames = null;
 
   for (let i = 0; i < targets.length; i++) {
     const url = targets[i];
@@ -928,11 +932,20 @@ async function performScan(domain, progress) {
         body = await res.text().catch(() => null);
 
       // Common signals — extracted once and merged into every provider
-      const common = extractCommonSignals(res);
+      const common = extractCommonSignals(res, domain);
       for (const p of providers) {
         Object.assign(allSig[p.id], common);
         try { p.extract(res, body, allSig[p.id]); }
         catch { /* provider extractor must not crash the shared pass */ }
+      }
+
+      // Snapshot header NAMES (not values — values may contain secrets/
+      // session data) from the apex-domain response only, for later
+      // unknown-header detection. Headers is a live iterator tied to this
+      // fetch's scope, so we capture it as a plain array now rather than
+      // trying to re-read `res` after this loop ends.
+      if (i === 0 && !lastResponseHeaderNames) {
+        lastResponseHeaderNames = [...res.headers.keys()];
       }
     } catch {}
   }
@@ -1046,7 +1059,7 @@ async function performScan(domain, progress) {
   if (cdn_detected.length >= 2) {
     migrationWarning = {
       candidates: cdn_detected,
-      note: 'Two or more CDN/edge providers detected simultaneously. This may indicate an in-progress infrastructure migration, a misconfigured CNAME chain, or a deliberate multi-CDN setup — worth verifying.'
+      note: `${cdn_detected.length} CDNs detected at once — check for an in-progress migration or CNAME misconfig.`
     };
   }
 
@@ -1058,6 +1071,10 @@ async function performScan(domain, progress) {
   const httpsRecord = _firstSig._httpsRecord || null;
   const spfDmarc    = _firstSig._spfDmarc    || null;
   const anycast     = _firstSig._anycast      || null;
+
+  // Automatic unknown-header detection (crowd-report upgrade) — only
+  // meaningful once we know which providers were actually detected.
+  const unknownHeaders = findUnknownHeaders(lastResponseHeaderNames, detectedIds);
 
   return {
     providers: results,
@@ -1072,6 +1089,7 @@ async function performScan(domain, progress) {
     httpsRecord,   // A1 — ECH, ALPN, IPv4 hints from HTTPS RR
     spfDmarc,      // A4 — email infra (SPF provider + DMARC policy)
     anycast,       // A5 — multi-resolver IP divergence map
+    unknownHeaders, // Crowd-report upgrade — headers not recognized by any provider
     scannedAt: new Date().toISOString()
   };
 }
@@ -1145,6 +1163,67 @@ async function maybeSubmitCrowdReport(providerId, unknownHeaderNames) {
       body: JSON.stringify({ providerId, unknownHeaderNames, engineVersion: ENGINE_VERSION })
     }, 5000);
   } catch { /* best-effort, never block or surface errors to the user */ }
+}
+
+// ── Automatic unknown-header detection (crowd-report upgrade) ──────
+// The crowd-report feature only had value if people actually used it, and
+// requiring someone to manually notice "hm, this header looks unfamiliar"
+// and type a note is a high bar that mostly goes unused (this is likely
+// why a real, already-deployed Worker endpoint sees so little traffic).
+// This replaces that manual-noticing step with automatic detection: every
+// response header is checked against a known-header list built from (a)
+// standard HTTP/CDN headers and (b) every header name already referenced
+// across all 24 provider files. Anything left over — but ONLY on domains
+// where a provider was actually detected — is surfaced as a one-click
+// "report this?" suggestion. Nothing is ever sent without the person
+// clicking to confirm; this only removes the burden of having to notice
+// and type the note by hand.
+const STANDARD_HTTP_HEADERS = new Set([
+  'date','content-type','content-length','connection','server','cache-control',
+  'expires','last-modified','etag','vary','content-encoding','transfer-encoding',
+  'set-cookie','location','content-disposition','content-language','content-range',
+  'accept-ranges','age','allow','link','referrer-policy','strict-transport-security',
+  'x-content-type-options','x-frame-options','x-xss-protection','access-control-allow-origin',
+  'access-control-allow-methods','access-control-allow-headers','access-control-allow-credentials',
+  'access-control-expose-headers','access-control-max-age','content-security-policy',
+  'content-security-policy-report-only','permissions-policy','cross-origin-opener-policy',
+  'cross-origin-embedder-policy','cross-origin-resource-policy','timing-allow-origin',
+  'nel','report-to','alt-svc','via','x-cache','x-powered-by','x-request-id','x-correlation-id',
+  'x-cache-hits','pragma','warning','upgrade','x-dns-prefetch-control','server-timing',
+  'x-robots-tag','x-frame-options','x-ua-compatible','origin-trial','clear-site-data',
+]);
+// Built once at module load by scanning every provider's known signal
+// sources — cheap, and providers rarely change their header lists at runtime.
+let KNOWN_PROVIDER_HEADERS_CACHE = null;
+function buildKnownProviderHeaders() {
+  if (KNOWN_PROVIDER_HEADERS_CACHE) return KNOWN_PROVIDER_HEADERS_CACHE;
+  const known = new Set(STANDARD_HTTP_HEADERS);
+  // Each provider file's extract() function references header names as
+  // string literals passed to hR()/h()/res.headers.get()/res.headers.has().
+  // We can't introspect function source safely/portably here, so instead
+  // each provider declares its own header vocabulary via an optional
+  // `knownHeaders` array — providers updated in this pass populate it;
+  // providers that don't are simply not contributing to the known-list
+  // (meaning their own headers might get flagged as "unknown", which is
+  // a safe failure mode — worst case is an occasional redundant report).
+  const providers = self.CDN_PROVIDERS || [];
+  for (const p of providers) {
+    for (const h of (p.knownHeaders || [])) known.add(h.toLowerCase());
+  }
+  KNOWN_PROVIDER_HEADERS_CACHE = known;
+  return known;
+}
+function findUnknownHeaders(headerNames, detectedProviderIds) {
+  if (!detectedProviderIds.length || !headerNames?.length) return [];
+  const known = buildKnownProviderHeaders();
+  const unknown = [];
+  for (const name of headerNames) {
+    const lower = name.toLowerCase();
+    if (known.has(lower)) continue;
+    if (/^(set-cookie|x-.*-request-id|x-request-id)$/i.test(lower)) continue;
+    unknown.push(name);
+  }
+  return unknown;
 }
 
 
@@ -1776,173 +1855,7 @@ async function queryASN(ip) {
 // so both are omitted rather than faked.
 // ════════════════════════════════════════════════════════════════
 
-// ── #3: RUM-style Core Web Vitals, correlated with detected provider ──
-// Stored locally, aggregated over time, to answer "is my Cloudflare setup
-// actually faster than my old Fastly setup" using the person's OWN
-// browsing data — not a synthetic benchmark claim.
-const RUM_STORAGE_KEY = 'rum_vitals_by_provider';
-const MAX_RUM_SAMPLES_PER_PROVIDER = 200;
-
-async function recordRumSample(providerIds, vitals) {
-  if (!providerIds?.length || !vitals) return;
-  try {
-    const { [RUM_STORAGE_KEY]: store = {} } = await chrome.storage.local.get(RUM_STORAGE_KEY);
-    for (const pid of providerIds) {
-      const arr = store[pid] || [];
-      arr.unshift({ ts: Date.now(), ...vitals });
-      store[pid] = arr.slice(0, MAX_RUM_SAMPLES_PER_PROVIDER);
-    }
-    await chrome.storage.local.set({ [RUM_STORAGE_KEY]: store });
-  } catch {}
-}
-async function getRumSummary() {
-  try {
-    const { [RUM_STORAGE_KEY]: store = {} } = await chrome.storage.local.get(RUM_STORAGE_KEY);
-    const summary = {};
-    for (const [pid, samples] of Object.entries(store)) {
-      if (!samples.length) continue;
-      const avg = key => {
-        const vals = samples.map(s => s[key]).filter(v => typeof v === 'number');
-        return vals.length ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length) : null;
-      };
-      const median = key => {
-        const vals = samples.map(s => s[key]).filter(v => typeof v === 'number').sort((a, b) => a - b);
-        if (!vals.length) return null;
-        return vals[Math.floor(vals.length / 2)];
-      };
-      summary[pid] = {
-        sampleCount: samples.length,
-        avgLCP: avg('lcp'), avgINP: avg('inp'), avgCLS: avg('cls'), avgTTFB: avg('ttfb'),
-        medianLCP: median('lcp'), medianTTFB: median('ttfb'),
-      };
-    }
-    return summary;
-  } catch { return {}; }
-}
-
-// ── #4: Third-party script waterfall attribution ──────────────
-// Classifies PerformanceResourceTiming entries into "same as detected CDN"
-// vs "unrelated third party" (analytics, ads, fonts, trackers) so people
-// can see how much load time is actually caused by non-CDN third parties.
-const KNOWN_THIRD_PARTY_CATEGORIES = [
-  { re: /google-analytics\.com|googletagmanager\.com|analytics\.google\.com/, category: 'Analytics', name: 'Google Analytics/Tag Manager' },
-  { re: /doubleclick\.net|googlesyndication\.com|adservice\.google/, category: 'Ads', name: 'Google Ads' },
-  { re: /facebook\.net|connect\.facebook\.com/, category: 'Social/Tracking', name: 'Facebook Pixel' },
-  { re: /hotjar\.com/, category: 'Analytics', name: 'Hotjar' },
-  { re: /segment\.(io|com)/, category: 'Analytics', name: 'Segment' },
-  { re: /intercom\.io/, category: 'Chat/Support', name: 'Intercom' },
-  { re: /fonts\.googleapis\.com|fonts\.gstatic\.com/, category: 'Fonts', name: 'Google Fonts' },
-  { re: /cdn\.jsdelivr\.net|unpkg\.com|cdnjs\.cloudflare\.com/, category: 'Library CDN', name: 'Public library CDN' },
-  { re: /stripe\.com|js\.stripe\.com/, category: 'Payments', name: 'Stripe' },
-  { re: /recaptcha\.net|gstatic\.com\/recaptcha/, category: 'Bot check', name: 'reCAPTCHA' },
-  { re: /sentry\.io/, category: 'Error tracking', name: 'Sentry' },
-  { re: /clarity\.ms/, category: 'Analytics', name: 'Microsoft Clarity' },
-  { re: /tiktok\.com\/i18n|analytics\.tiktok\.com/, category: 'Social/Tracking', name: 'TikTok Pixel' },
-];
-function classifyThirdPartyEntries(entries, mainDomain) {
-  const buckets = {};
-  let mainDomainTime = 0, thirdPartyTime = 0;
-  for (const e of entries) {
-    let host;
-    try { host = new URL(e.name).hostname; } catch { continue; }
-    const duration = e.responseEnd - e.startTime;
-    if (host === mainDomain || host.endsWith(`.${mainDomain}`)) {
-      mainDomainTime += duration;
-      continue;
-    }
-    const match = KNOWN_THIRD_PARTY_CATEGORIES.find(c => c.re.test(host));
-    const category = match?.category || 'Other third-party';
-    const name = match?.name || host;
-    if (!buckets[category]) buckets[category] = { category, items: {}, totalMs: 0 };
-    buckets[category].items[name] = (buckets[category].items[name] || 0) + duration;
-    buckets[category].totalMs += duration;
-    thirdPartyTime += duration;
-  }
-  return {
-    mainDomainTimeMs: Math.round(mainDomainTime),
-    thirdPartyTimeMs: Math.round(thirdPartyTime),
-    thirdPartyPct: (mainDomainTime + thirdPartyTime) > 0
-      ? Math.round((thirdPartyTime / (mainDomainTime + thirdPartyTime)) * 100) : 0,
-    buckets: Object.values(buckets).sort((a, b) => b.totalMs - a.totalMs),
-  };
-}
-
-// ── #5: CDN "service tier" heuristic ───────────────────────────
-// Not a claim about actual billing plan — purely inferred from feature
-// signals that correlate with paid tiers on major CDNs. Framed as a
-// heuristic, never as a fact, in both the code and the UI text.
-function inferServiceTier(providerId, signals, headers) {
-  const h = name => headers?.[name.toLowerCase()] || '';
-  const indicators = [];
-  let tierScore = 0;
-
-  if (providerId === 'cloudflare') {
-    if (/webp|avif/i.test(h('content-type')) && signals.imageOptimization) { indicators.push('Image optimization (Polish) active'); tierScore += 2; }
-    if (h('cf-cache-status') === 'DYNAMIC' && signals.argoDetected) { indicators.push('Argo Smart Routing hints'); tierScore += 2; }
-    if (signals.wafRulesActive) { indicators.push('Custom WAF rules active'); tierScore += 1; }
-  }
-  if (providerId === 'fastly') {
-    if (signals.imageOptimization) { indicators.push('Fastly Image Optimizer active'); tierScore += 2; }
-  }
-  if (providerId === 'akamai') {
-    if (signals.imageManager) { indicators.push('Akamai Image & Video Manager'); tierScore += 2; }
-  }
-
-  const tier = tierScore >= 3 ? 'Likely paid/enterprise tier' : tierScore >= 1 ? 'Possibly upgraded tier' : 'Insufficient signal';
-  return { tier, indicators, tierScore, disclaimer: 'Heuristic only — inferred from optional features, not actual billing data.' };
-}
-
-// ── #7: well-known files OSINT (robots.txt, security.txt) ─────
-async function probeWellKnownFiles(domain) {
-  const out = { robotsTxt: null, securityTxt: null, findings: [] };
-  try {
-    const res = await fetchT(`https://${domain}/robots.txt`, {}, 6000);
-    if (res.ok) {
-      const text = await res.text();
-      out.robotsTxt = { status: res.status, length: text.length, snippet: text.slice(0, 500) };
-      // Look for CDN-injected comments (some CDNs stamp cache metadata as comments)
-      const cdnComment = text.match(/^#.*\b(cloudflare|akamai|fastly|cloudfront)\b.*/im);
-      if (cdnComment) out.findings.push(`robots.txt comment mentions: ${cdnComment[0].slice(0, 120)}`);
-      // Sitemap references can reveal additional subdomains
-      const sitemaps = [...text.matchAll(/^Sitemap:\s*(\S+)/gim)].map(m => m[1]);
-      if (sitemaps.length) out.findings.push(`${sitemaps.length} sitemap reference(s) found`);
-    }
-  } catch {}
-  try {
-    const paths = [`/.well-known/security.txt`, `/security.txt`];
-    for (const p of paths) {
-      const res = await fetchT(`https://${domain}${p}`, {}, 6000);
-      if (res.ok) {
-        const text = await res.text();
-        out.securityTxt = { path: p, length: text.length, snippet: text.slice(0, 500) };
-        const bugBounty = text.match(/^Policy:\s*(\S+)/im) || text.match(/^Hiring:\s*(\S+)/im);
-        if (bugBounty) out.findings.push(`security.txt references: ${bugBounty[0]}`);
-        break;
-      }
-    }
-  } catch {}
-  return out;
-}
-
-// ── #8: "Blast radius" — other domains sharing the same IP ─────
-// Uses Shodan InternetDB (free, no key) reverse-hostname info when present;
-// falls back to a note that full reverse-IP lookup needs a paid service.
-async function checkBlastRadius(ip) {
-  try {
-    const res = await fetchT(`https://internetdb.shodan.io/${encodeURIComponent(ip)}`, {}, 8000);
-    if (!res.ok) return { ip, hostnames: [], note: 'InternetDB lookup failed' };
-    const data = await res.json();
-    return {
-      ip,
-      hostnames: data.hostnames || [],
-      note: (data.hostnames || []).length > 1
-        ? `${data.hostnames.length} hostnames share this IP — likely shared hosting/CDN edge, not necessarily related sites`
-        : 'No additional hostnames found via free lookup (full reverse-IP databases may know more)',
-    };
-  } catch (e) { return { ip, hostnames: [], note: e.message }; }
-}
-
-// ── #9: CDN status-page correlation ────────────────────────────
+// ── CDN status-page correlation ────────────────────────────
 // When a watchlist diff looks like a provider change, check whether that
 // provider is having a known outage — avoids false "they migrated!" alarms
 // when it's really "Cloudflare is down right now".
@@ -1972,7 +1885,7 @@ async function checkProviderStatus(providerId) {
   } catch { return null; }
 }
 
-// ── #10: Shareable "infrastructure fingerprint" string ─────────
+// ── Shareable "infrastructure fingerprint" string ─────────
 // A compact, JA4-style human-readable string summarizing the whole scan —
 // meant to be pasted in chat/tickets for quick comparison, not a security
 // hash. Format: CDNW1_<providers>_<dns>_<ech><anycast>_<layers>
@@ -2011,6 +1924,44 @@ async function queryWaybackHistory(domain) {
       sampleTimestamps: timestamps,
     };
   } catch { return null; }
+}
+
+// ════════════════════════════════════════════════════════════════
+// Round 7 — declutter-driven improvements
+// (v9.5.0 cleanup: #1 adaptive density, #3 baseline comparison, #5 flag-for-
+// review, #7 bookmarks/tabs batch source, #9 weekly digest, #14 auto-suggest
+// rule, and #15 watchlist dashboard were all removed — each added real
+// complexity for a feature that saw little practical use or duplicated
+// something already covered elsewhere (Pin already covers "mark this
+// domain"; Timeline already covers "what changed"; watchlist notifications
+// already fire in real time). #6 below is kept — genuinely useful.)
+// ════════════════════════════════════════════════════════════════
+
+// ── #6: Preview a custom-provider rule against scan history ────
+// Runs a draft rule (not yet saved) against every locally-stored snapshot
+// to show what WOULD have matched, so a rule can be tuned before being
+// added for real — catches "this rule is way too broad" before it pollutes
+// every future scan.
+async function previewCustomRule(draftRule) {
+  try {
+    const clean = validateCustomProviderSchema(draftRule); // reuse existing validator
+    const allKeys = await chrome.storage.local.get(null);
+    const snapshotEntries = Object.entries(allKeys).filter(([k]) => k.startsWith('snap_'));
+
+    const matches = [];
+    for (const [key, list] of snapshotEntries) {
+      const domain = key.replace(/^snap_/, '');
+      const latest = list[0]; // most recent snapshot for this domain
+      if (!latest) continue;
+      const cname = latest.result?.providers?.[Object.keys(latest.result.providers)[0]]?.signals?.cname || null;
+      // headerSnapshot isn't stored historically (only live scans capture
+      // raw headers) — preview is CNAME-only for historical data, which is
+      // disclosed in the returned note so it isn't mistaken for a full match.
+      const scored = scoreCustomProvider(clean, cname, {});
+      if (scored.score > 0) matches.push({ domain, score: scored.score, hits: scored.hits });
+    }
+    return { ok: true, provider: clean, matches, note: 'Historical preview only checks CNAME (header snapshots aren\'t stored from past scans) — a live scan may match more broadly via headerChecks.' };
+  } catch (e) { return { ok: false, error: e.message }; }
 }
 
 // ── Port listener (progress streaming) ───────────────────────
@@ -2173,11 +2124,6 @@ chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
     injectAndGetTimingData(msg.tabId).then(data => sendResponse({ data }));
     return true;
   }
-  // #3/#4: Core Web Vitals + resource waterfall from active tab
-  if (msg.action === 'getVitalsAndWaterfall') {
-    injectAndGetVitals(msg.tabId).then(data => sendResponse({ data }));
-    return true;
-  }
   // D1: Full snapshot for infrastructure-diff timeline
   if (msg.action === 'getSnapshotHistory') {
     getSnapshotHistory(msg.domain).then(list => sendResponse({ snapshots: list }));
@@ -2200,57 +2146,25 @@ chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
     queryASN(msg.ip).then(r => sendResponse({ data: r }));
     return true;
   }
-  // #3: RUM Core Web Vitals summary per provider
-  if (msg.action === 'getRumSummary') {
-    getRumSummary().then(summary => sendResponse({ summary }));
-    return true;
-  }
-  if (msg.action === 'recordRumSample') {
-    recordRumSample(msg.providerIds, msg.vitals).then(() => sendResponse({ ok: true }));
-    return true;
-  }
-  // #4: Third-party waterfall attribution (entries collected client-side, classified here)
-  if (msg.action === 'classifyThirdParty') {
-    try {
-      const result = classifyThirdPartyEntries(msg.entries || [], msg.mainDomain || '');
-      sendResponse({ result });
-    } catch (e) { sendResponse({ error: e.message }); }
-    return true;
-  }
-  // #5: CDN service-tier heuristic
-  if (msg.action === 'inferServiceTier') {
-    try {
-      const result = inferServiceTier(msg.providerId, msg.signals || {}, msg.headers || {});
-      sendResponse({ result });
-    } catch (e) { sendResponse({ error: e.message }); }
-    return true;
-  }
-  // #7: well-known files OSINT (robots.txt, security.txt)
-  if (msg.action === 'probeWellKnownFiles') {
-    probeWellKnownFiles(msg.domain).then(r => sendResponse(r))
-      .catch(e => sendResponse({ error: e.message }));
-    return true;
-  }
-  // #8: Blast radius — other hostnames sharing this IP
-  if (msg.action === 'checkBlastRadius') {
-    checkBlastRadius(msg.ip).then(r => sendResponse(r))
-      .catch(e => sendResponse({ error: e.message }));
-    return true;
-  }
-  // #9: CDN provider status-page check
+  // CDN provider status-page check
   if (msg.action === 'checkProviderStatus') {
     checkProviderStatus(msg.providerId).then(r => sendResponse({ status: r }));
     return true;
   }
-  // #10: Shareable infrastructure fingerprint string
+  // Wayback Machine historical cross-check
+  if (msg.action === 'queryWaybackHistory') {
+    queryWaybackHistory(msg.domain).then(r => sendResponse({ data: r }));
+    return true;
+  }
+  // #6: Custom-rule preview against history
+  if (msg.action === 'previewCustomRule') {
+    previewCustomRule(msg.draftRule).then(r => sendResponse(r));
+    return true;
+  }
+  // Shareable infrastructure fingerprint string
   if (msg.action === 'buildFingerprint') {
     try { sendResponse({ fingerprint: buildFingerprintString(msg.result) }); }
     catch (e) { sendResponse({ error: e.message }); }
-    return true;
-  }
-  // #11: Wayback Machine historical cross-check
-  if (msg.action === 'queryWaybackHistory') {
-    queryWaybackHistory(msg.domain).then(r => sendResponse({ data: r }));
     return true;
   }
   // Clipboard scan: background receives domain from popup clipboard button
@@ -2565,44 +2479,6 @@ async function injectAndGetTimingData(tabId) {
   } catch { return null; }
 }
 
-// ── #3/#4: Core Web Vitals + resource waterfall from the active tab ──
-// Reads already-buffered PerformanceObserver entries (buffered: true means
-// entries recorded before this injection still get captured retroactively,
-// as long as the page hasn't fully cleared its performance timeline).
-// Vitals are approximate (best-effort from buffered entries, not a live
-// observer attached from page load) — good enough for local trend tracking,
-// not claimed as lab-precise measurement.
-async function injectAndGetVitals(tabId) {
-  try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        const nav = performance.getEntriesByType('navigation')[0] || {};
-        const ttfb = (nav.responseStart - nav.requestStart) || null;
-
-        let lcp = null;
-        try {
-          const lcpEntries = performance.getEntriesByType('largest-contentful-paint');
-          if (lcpEntries.length) lcp = lcpEntries[lcpEntries.length - 1].renderTime || lcpEntries[lcpEntries.length - 1].loadTime || null;
-        } catch {}
-
-        let cls = 0;
-        try {
-          const clsEntries = performance.getEntriesByType('layout-shift');
-          for (const e of clsEntries) if (!e.hadRecentInput) cls += e.value;
-        } catch {}
-
-        const resourceEntries = performance.getEntriesByType('resource').map(e => ({
-          name: e.name, startTime: e.startTime, responseEnd: e.responseEnd,
-        }));
-
-        return {
-          vitals: { lcp, cls: Math.round(cls * 1000) / 1000, ttfb },
-          resourceEntries: resourceEntries.slice(0, 300), // cap payload size
-          mainDomain: location.hostname,
-        };
-      },
-    });
-    return results?.[0]?.result || null;
-  } catch { return null; }
-}
+// (Core Web Vitals capture + third-party waterfall attribution removed
+// in v9.5.0 cleanup — required manual "capture from current tab" action
+// with low practical usage relative to the code complexity involved.)

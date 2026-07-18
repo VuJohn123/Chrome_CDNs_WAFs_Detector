@@ -20,6 +20,15 @@
 self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'datadome', name: 'DataDome', color: '#7c3aed', icon: '🤖',
+
+  knownHeaders: [
+    'x-datadome',
+    'x-datadome-botfamily',
+    'x-datadome-botname',
+    'x-datadome-clientid',
+    'x-datadome-isbot',
+    'x-dd-b',
+  ],
   ipConfig: null, // DataDome does not publish machine-readable IP ranges (deployed inline, not as a proxy network)
 
   freshSignals: () => ({

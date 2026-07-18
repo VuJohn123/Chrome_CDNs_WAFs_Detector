@@ -12,6 +12,14 @@
 self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'gcore', name: 'Gcore', color: '#f04e23', icon: '🌐',
+
+  knownHeaders: [
+    'g-shield',
+    'x-cached-since',
+    'x-gcore-location',
+    'x-gcore-pop',
+    'x-id',
+  ],
   ipConfig: null,
 
   freshSignals: () => ({

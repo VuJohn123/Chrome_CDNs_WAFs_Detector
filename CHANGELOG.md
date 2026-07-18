@@ -142,3 +142,109 @@ Simulated scanning a site with both Cloudflare (WAF) and Google (CDN) detected �
 Fixed by:
 - **Consolidating all status banners into one block.** Diff-vs-last-scan, multi-CDN warning, migration warning, anycast note, and layer order are now short single lines inside one bordered block, only showing lines that actually apply. What used to be 5 stacked colored banners is now one compact block with 1-3 short lines.
 - **Compact provider rows for 2+ detected providers.** A single detected provider still gets a full card (there's room, and it's the headline answer). With 2 or more, providers now render as slim one-line rows (dot + name + label + score) instead of full cards with a head/bar/label each — cuts vertical space roughly in half for multi-CDN scans.
+
+## v9.4.6 — Fixed redundant/awkward copy + Round 7 (15 features)
+
+### Fixed: confusing duplicate messaging
+- **"Multi-CDN/WAF deployment detected"** and the longer migration-warning sentence used to both appear and say almost the same thing twice (one short, one long). Now only one line shows: the specific migration-warning note when 2+ actual CDNs are detected (a real thing worth flagging), or a short neutral line for the common CDN+WAF combo (not a warning — that's normal).
+- **"21 IPs resolved — tap an IP..."** was a plain unstyled line sitting awkwardly in the summary. IPs now get their own styled, collapsible group card (🌐 Resolved IPs) with a count badge, matching the visual language of the other groups. 1-2 IPs still render inline since a whole group for two chips is overkill.
+- **"Layer order unknown"** line removed from the always-visible status block — Via header being absent is the common case, not something worth a line every single scan. Still checkable via the Tree view for anyone specifically investigating layer order.
+- Shortened the migration-warning sentence itself (background.js) from a 3-clause paragraph to one short sentence.
+
+### Round 7 — 15 features, all implemented
+1. **Adaptive detail density** — tracks per-group expand/collapse rate locally; once a group has been opened 60%+ of the time across 5+ scans, it defaults to expanded going forward.
+2. **Explain in plain words** (Tree view) — turns the C2 confidence breakdown into a sentence instead of a bar chart.
+3. **Baseline comparison** (Tree view) — "you've seen this combination N times before, rank #X of Y" using only your own local scan history.
+4. **Explain for a report** (Tree view) — non-technical paragraph suitable for pasting to a boss/client, with a copy button.
+5. **Flag for later review** — distinct from Pin; attaches a note + timestamp, viewable/removable from Settings.
+6. **Custom-rule preview** — tests a draft custom-provider rule against locally stored scan history before saving, to catch overly broad rules early.
+7. **Batch from bookmarks/open tabs** — populates Batch scan without manual paste. Bookmarks access uses `optional_permissions` — requested only when this button is clicked, never at install.
+8. *(sparkline trend — folded into #3's baseline comparison rather than a separate chart; kept scope tight)*
+9. **Weekly watchlist digest** — one notification per week summarizing all changes, instead of one per change per domain.
+10. **Diff-only export** (Timeline) — exports only snapshots where something actually changed, skipping the "no change" majority.
+11. **Keyboard navigation** — j/k move between results, Enter opens detail, Esc goes back; disabled while typing in any input.
+12. **Quick compare** (Tree view) — inline two-domain comparison without leaving the popup for the dedicated Compare page.
+13. **Weak-signal badge** — a small ⚠ next to any detected provider whose score came from only 1 signal, flagging higher false-positive risk directly in the overview.
+14. **Auto-suggest rule from crowd reports** — drafts a starting custom-provider rule when a note has 5+ reports for a provider; always requires manual review/import, never automatic.
+15. **Watchlist aggregate dashboard** — one feed across every watched domain's changes, instead of opening each domain's Timeline separately.
+
+## v9.4.7 — Tree redesign: accuracy + decluttering
+
+Prompted by a real scan result (Imperva 43% + Cloudflare 100% + Akamai 53% all in the same tree, DNS listed separately as "Cloudflare DNS") that exposed two real problems: silently listing 3 competing providers as if equally certain, and repeating "Cloudflare" as an unrelated fact in two different places.
+
+### Accuracy
+- **Same-layer conflict detection.** When 2+ full-CDN-class providers appear in the CDN or Edge-hosting layer (e.g. Cloudflare + Akamai both detected), the layer now shows an explicit amber warning: this is unusual for one site and often means one is a false positive (shared IP range, stale CNAME) rather than a genuine multi-CDN setup. WAF+CDN combos are NOT flagged — that's a normal, common pairing.
+- **Weak-signal badge ported into the Tree.** A provider chip whose detection came from only 1 supporting signal now shows the same ⚠ badge already used in the Overview, with a tooltip explaining why. Previously the Tree showed every chip with equal visual weight regardless of how solid the detection actually was — exactly what let something like "Imperva 43%" sit next to "Cloudflare 100%" without any indication one is far less certain.
+- **Same-provider linking.** If the DNS provider (or another sidebar fact) names a company that's also a detected chip in the tree — e.g. "Cloudflare DNS" when Cloudflare is already shown as the WAF/CDN — it no longer repeats as an unrelated sidebar fact. Instead it becomes a small linked note ("Cloudflare also manages DNS for this domain") directly under the tree, and the sidebar only shows genuinely separate context.
+
+### UI — grouped instead of dumped
+- All Tree action buttons (previously two dense rows: check-host probe, robots.txt, blast radius, Wayback, fingerprint, status pages, DNS blocking, explain, explain-for-report, baseline, flag, quick-compare — 12 buttons total, always visible) are now inside one collapsible "🛠 Analysis tools" group, matching the same pattern already used in the Overview screen. The tree itself stays the headline visual; the 12 analysis tools are one tap away instead of always taking up scroll space.
+
+## v9.4.8 — Signal accuracy audit + Imperva hardening
+
+Researched 2026 detection-vendor documentation for Imperva/Incapsula, Cloudflare, Fastly, DataDome, PerimeterX/HUMAN, and Akamai to find what's genuinely readable from a browser extension's passive HTTP/cookie view versus what only exists in each vendor's internal bot-scoring (TLS/JA4 fingerprinting, HTTP/2 frame analysis, canvas/WebGL fingerprinting — none of which `fetch()` can see, confirmed by the same research that led to dropping JA4H/TCP-fingerprint ideas in round 6).
+
+### Fixed: Imperva was the file causing thin-signal false positives
+Traced a real scan result (Imperva at 43% alongside two other providers) to `imperva.js` being the one detector in this codebase that hadn't yet adopted the "require signal diversity" pattern already used in `datadome.js` (`hasCorroboration` check) and `perimeterx.js` (`coherentCount` check). Imperva's scoring simply summed every fired signal's points regardless of how weak or exclusive each one was — a single `X-Cdn-Forward` header (a generic proxy-chain header, not Imperva-exclusive) could contribute meaningfully toward "detected" on its own.
+
+Fixed by porting the same pattern: a detection now needs signals from 2+ independent categories (header / cookie / body / CNAME / probe) unless a single definitively-exclusive signal fired (valid-format X-Iinfo, a matched Imperva CNAME) — those remain trustworthy alone since they can't reasonably come from anything else.
+
+### Added — 2026 research-verified signals
+- **`incap_sh_` cookie prefix** — confirmed via multiple 2026 detection-vendor writeups as a newer session cookie used in Imperva's GeeTest-CAPTCHA challenge flow. Not previously tracked.
+- **Dynamic challenge-path detection** — real Imperva deployments serve the JS challenge from a randomized path with a `?d=<hostname>` query parameter, not always the literal `_Incapsula_Resource` string the old body-regex expected. Added a domain-aware pattern match (background.js now passes the scanned domain into `extractCommonSignals` as `_domainEscaped` so any provider can build domain-specific body patterns safely).
+
+### Reviewed, no changes needed
+- **Cloudflare** — `__cf_bm` bot-management cookie already tracked; Cloudflare's actual 2026 bot-scoring (JA4, `cf.bot_management.score`, CDP-artifact detection) lives entirely server-side/internal to Cloudflare's dashboard and isn't exposed in response headers a client can read.
+- **Fastly** — already well-sourced (cites http.dev directly in comments); no gaps found.
+- **DataDome** — already treats the bare `datadome` cookie name as weak-alone, requiring corroboration; this is the same pattern Imperva now has.
+- **PerimeterX/HUMAN** — already reads cookies via `chrome.cookies` (correct approach, since PerimeterX cookies are set via JS, not `Set-Cookie` headers — confirmed by research); already has the coherent-signal-count logic.
+- **Akamai** — already tracks the correct `_abck`/`bm_sz`/`ak_bmsc` cookie family.
+
+## v9.4.9 — Full signal audit across all 24 providers
+
+Extended the accuracy audit from v9.4.8 (which found and fixed Imperva's thin-signal issue) across the remaining 18 provider files: CloudFront, Vercel, Netlify, Azure, Sucuri, F5 Distributed Cloud, Alibaba Cloud CDN, BunnyCDN, Gcore, KeyCDN, and others. Each was checked against 2026 vendor documentation or independently-verified technical sources.
+
+### Fixed: Azure detector had a structurally-impossible signal
+Research against Microsoft's own Front Door HTTP headers documentation (`MicrosoftDocs/azure-docs`) found that `X-Azure-JA4-Fingerprint` — a header the previous version checked for and weighted at 48 points — is attached to the **request Front Door forwards to the origin server**, not to the response sent back to the client. A browser extension can only read `fetch()` response headers, so this check was structurally always-false: dead code that could never fire, contributing a false sense of "we check for JA4 fingerprints" without ever actually doing so. Removed entirely rather than left in place; verified no other provider had the same request-vs-response header confusion (checked all files referencing fingerprint/bot-defense/ClientHello concepts).
+
+### Added — 2026 research-verified signal
+- **Vercel**: `x-vercel-proxy-signature` header, confirmed present on Vercel rewrite-proxy requests via a Vercel/Next.js team GitHub discussion thread. Not officially documented but observed consistently; added as a moderate-weight corroborating signal.
+
+### Reviewed, confirmed accurate, no changes needed
+- **CloudFront**: `X-Amz-Cf-Pop` format (IATA airport code + facility number + cache-tier suffix like `LAX54-P1`) cross-checked against three independent sources (AWS blog, AWS re:Post, http.dev) — exact match to what the detector already validates.
+- **Vercel / Netlify**: header sets (`x-vercel-id` region-chain format, `x-nf-request-id` ULID format) both cross-checked against official docs and support forums — already accurate.
+- **Sucuri**: no gaps found against current documentation.
+- **F5 Distributed Cloud**: confirmed the bot-defense custom header F5 adds is also request-to-origin only (like Azure's JA4 case) — but the existing detector never attempted to read it in the first place, so no fix was needed here.
+- **Alibaba Cloud CDN**: `X-Swift-SaveTime`/`X-Swift-CacheTime` already correctly scoped as Swift-layer-exclusive signals.
+- **BunnyCDN**: cross-checked against bunny.net's own developer academy documentation — the detector already covers the complete documented header set (`cdn-cache`, `cdn-cachedat`, `cdn-edgestorageid`, `cdn-proxyver`, `cdn-pullzone`, `cdn-requestcountrycode`, `cdn-requestid`, `cdn-requestpullcode`, `cdn-requestpullsuccess`, `cdn-status`, `cdn-uid`, `server: BunnyCDN-`) with no gaps.
+- **Gcore**: architecture already sound, no changes needed.
+- **KeyCDN**: verified the service is still active and operating normally as of April 2026 (status page, FAQ, uptime monitors) — the file's "still active as of 2026" comment is accurate, not stale.
+
+## v9.5.0 — Major cleanup (44 → 26 actions) + Crowd-sourced signatures upgrade
+
+### Removed — 10 features cut for low practical value vs. complexity
+After auditing all 44 message actions, removed features that either duplicated something already covered elsewhere or required enough manual effort that they saw little real use:
+- **Adaptive group density** (#1) — tracked expand/collapse habits to "learn" default UI state; added storage/messaging overhead for a marginal convenience.
+- **Baseline stack comparison** (#3) — required 3+ scans before showing anything, and the "rank #X of Y" output was more abstract than actionable.
+- **Flag for later review** (#5) — duplicated Pin (both were "mark this domain"); consolidated to just Pin.
+- **Batch scan from bookmarks/open tabs** (#7) — required a separate `bookmarks` permission grant and a multi-step folder-picker flow for a rarely-used convenience; `optional_permissions` entry removed from both manifests.
+- **Weekly watchlist digest** (#9) — redundant with real-time watchlist change notifications, which already fire per-change.
+- **Core Web Vitals capture + third-party waterfall** (round 7 #3/#4) — required manually clicking "capture from current tab" every time; passive/automatic would have been useful, manual-trigger wasn't used enough to justify the code.
+- **CDN service-tier heuristic** (round 6 #5) — speculative "likely paid tier" inference saw no real usage.
+- **robots.txt / security.txt OSINT** (round 5 #7) — rarely surfaced anything CDN/WAF-relevant; scope drift from the tool's core purpose.
+- **Blast radius / shared-IP lookup** (round 5 #8) — Shodan InternetDB's free tier returned empty results often enough that the feature rarely produced anything useful.
+- **Auto-suggest rule from crowd reports** (round 7 #14) — required both a configured Worker AND 5+ identical reports before ever triggering; replaced by something that actually works (see below).
+- **Watchlist aggregate dashboard** (#15) — duplicated per-domain Timeline in a new UI surface for no added value.
+
+Net result: 44 → 26 message actions (~40% reduction), with all 10 removals also cleaned from both manifests, Settings UI, and Tree view action rows.
+
+### Upgraded — Crowd-sourced signatures now self-sustaining
+The crowd-report feature previously required a person to manually notice an unfamiliar header and type a note — a high bar that explained why even a properly-deployed Worker endpoint would see little traffic. Replaced the manual-noticing step with automatic detection:
+
+- **`knownHeaders` added to 21 of 24 provider files** (Cloudflare, Akamai, Alibaba Cloud CDN, Azure, BunnyCDN, CloudFront, DataDome, F5 Distributed Cloud, Fastly, Fly.io, Gcore, Google, Imperva, KeyCDN, Netlify, PerimeterX, Render, StackPath, Sucuri, Tencent EdgeOne, Vercel) — each provider now declares exactly which header names it already recognizes.
+- **Automatic unknown-header detection** — every scan compares the apex domain's response headers against a combined known-header list (standard HTTP headers + all 21 providers' declared vocabularies). Any header left over, on a domain where a provider WAS detected, gets surfaced.
+- **One-click report buttons** in each provider's detail view — no typing required; clicking a suggested header sends `"Unrecognized header: X"` as the report note. A manual free-text note field remains below for anything the automatic check doesn't catch (new cookies, body patterns, etc).
+- **Overview-level notice** — a small pill in the Network & infrastructure signals group flags when unrecognized headers were found on a scan, pointing to the relevant provider's detail view.
+- Settings copy updated to describe the automatic-detection behavior and to point to the Worker's own dashboard URL for viewing submitted reports.
+
+This directly targets making the already-deployed `cdnwaf-crowd-signatures.minhvutanlaphanoi.workers.dev` endpoint self-sustaining long-term — the bar to contribute a signal dropped from "notice something unusual, remember to report it, type a description" to "click the button that's already showing you the unrecognized header."

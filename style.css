@@ -296,6 +296,11 @@ button {
   flex-wrap: wrap;
   gap: 4px;
 }
+.ip-chip-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
 .ip-chip {
   font-family: var(--mono);
   font-size: 10px;
@@ -446,6 +451,21 @@ button {
   margin-top: 1px;
 }
 .provider-card.undetected .pc-score { color: var(--text-faint); }
+
+/* ── #13: Weak-signal warning badge ─────────────────────────────── */
+.weak-signal-badge {
+  font-size: 10px;
+  color: var(--amber);
+  cursor: help;
+  flex-shrink: 0;
+}
+
+/* ── #11: Keyboard-navigation focus outline ─────────────────────── */
+.provider-card.kbd-focused,
+.provider-row-compact.kbd-focused {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
 
 .pc-bar-wrap {
   height: 2px;
@@ -1085,6 +1105,30 @@ body.sidepanel-mode .checks-list { max-height: none; }
   margin-left: 3px;
 }
 .tree-chip.chain-confirmed { border-width: 2px; box-shadow: 0 0 0 1px currentColor inset; }
+
+/* ── Same-layer conflict warning — flags 2+ competing full CDNs ────── */
+.tree-layer-conflict {
+  font-size: 9.5px;
+  color: var(--amber);
+  background: var(--amber-dim);
+  border: 1px solid rgba(245,166,35,0.25);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  margin-top: 8px;
+  line-height: 1.4;
+  max-width: 260px;
+}
+
+/* ── Same-provider linking — e.g. "Cloudflare also handles DNS" ───── */
+.tree-linked-notes { margin: 6px 0; text-align: center; }
+.tree-linked-note {
+  display: inline-block;
+  font-size: 10px;
+  color: var(--text-faint);
+  font-style: italic;
+  padding: 3px 0;
+}
+
 .tree-sidebar {
   background: var(--bg-2);
   border: 1px solid var(--border);

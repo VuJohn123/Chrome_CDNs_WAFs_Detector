@@ -18,6 +18,10 @@
 self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'perimeterx', name: 'PerimeterX', color: '#ff5a5f', icon: '🧩',
+
+  knownHeaders: [
+    'x-px-authorization',
+  ],
   ipConfig: null,
 
   freshSignals: () => ({

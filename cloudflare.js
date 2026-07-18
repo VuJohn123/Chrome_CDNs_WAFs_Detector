@@ -22,6 +22,16 @@ self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'cloudflare', name: 'Cloudflare', color: '#f38020', icon: '⛅',
 
+  // Feeds the automatic unknown-header detector (crowd-report upgrade) —
+  // any response header NOT in this list, seen on a domain where this
+  // provider was detected, gets surfaced as a possible new signal.
+  knownHeaders: [
+    'cf-ray','cf-cache-status','cf-connecting-ip','true-client-ip','cf-visitor',
+    'cf-edge-cache','cf-mitigated','cf-bgj','cf-ew-via','cf-ew-trace','cdn-loop',
+    'cf-pages-commit-sha','cf-pages-deployment-id','alt-svc','nel','report-to',
+    'server','server-timing',
+  ],
+
   ipConfig: {
     ipSignal: 'cfIP', storageKey: 'ip_cf', singleFile: false,
     v4Url: 'https://www.cloudflare.com/ips-v4',

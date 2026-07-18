@@ -13,6 +13,16 @@
 self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'stackpath', name: 'StackPath', color: '#2196f3', icon: '⚙',
+
+  knownHeaders: [
+    'x-cache-age',
+    'x-ec-custom-error',
+    'x-edgio-cache',
+    'x-edgio-request-id',
+    'x-pull-zone',
+    'x-sp-',
+    'x-sp-uid',
+  ],
   ipConfig: null,
 
   freshSignals: () => ({

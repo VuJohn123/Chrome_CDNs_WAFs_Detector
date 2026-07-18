@@ -573,6 +573,46 @@ const statusTextEl = document.getElementById('status-text');
 const cachedBadgeEl = document.getElementById('cached-badge');
 const domainInput = document.getElementById('domain');
 const resultsEl   = document.getElementById('results');
+
+// ── #11: Keyboard navigation within results ──────────────────
+// j/k move a "focused" highlight between provider rows/cards; Enter opens
+// the focused provider's detail; Esc goes back to the overview. Only
+// listens when focus isn't inside a text input (so typing in the domain
+// field or a settings textarea is never intercepted).
+let kbdFocusIndex = -1;
+function kbdFocusableItems() {
+  return [...resultsEl.querySelectorAll('.provider-card, .provider-row-compact')];
+}
+function applyKbdFocus(items) {
+  items.forEach((el, i) => el.classList.toggle('kbd-focused', i === kbdFocusIndex));
+  if (kbdFocusIndex >= 0 && items[kbdFocusIndex]) {
+    items[kbdFocusIndex].scrollIntoView({ block: 'nearest' });
+  }
+}
+document.addEventListener('keydown', e => {
+  const tag = document.activeElement?.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return; // never hijack typing
+
+  const items = kbdFocusableItems();
+  if (!items.length) return;
+
+  if (e.key === 'j') {
+    e.preventDefault();
+    kbdFocusIndex = Math.min(kbdFocusIndex + 1, items.length - 1);
+    applyKbdFocus(items);
+  } else if (e.key === 'k') {
+    e.preventDefault();
+    kbdFocusIndex = Math.max(kbdFocusIndex - 1, 0);
+    applyKbdFocus(items);
+  } else if (e.key === 'Enter' && kbdFocusIndex >= 0 && items[kbdFocusIndex]) {
+    e.preventDefault();
+    items[kbdFocusIndex].click();
+  } else if (e.key === 'Escape') {
+    const backBtn = resultsEl.querySelector('.back-btn');
+    if (backBtn) { e.preventDefault(); backBtn.click(); }
+  }
+});
+
 const progressEl  = document.getElementById('progress');
 const pctEl       = document.getElementById('pct');
 const barEl       = document.getElementById('pbar');
@@ -882,20 +922,30 @@ function renderOverview(result, cached, diff) {
 
   // ── GROUP 1: Summary — always visible, this is the headline answer ──
   const ipList = result.resolvedIPs || [];
-  const ipsHtml = ipList.length
-    ? `<div class="scan-ips">${ipList.map(ip => {
-        const ev = result.ipEvidence?.[ip];
-        const tag = ev?.org ? ` title="${escHtml(ev.org)}${ev.ptr ? ' · ' + escHtml(ev.ptr) : ''}"` : '';
-        const verified = ev?.matchedProviders?.length ? ' ip-verified' : '';
-        return `<span class="ip-chip${verified}" data-ip="${escHtml(ip)}"${tag}>${escHtml(ip)}</span>`;
-      }).join('')}</div>` : '';
-  const anycastNote = ipList.length > 1
-    ? `<div class="anycast-note">${ipList.length} IPs resolved — tap an IP for cross-verification (PTR/RDAP)</div>` : '';
+  const ipChipsHtml = ipList.map(ip => {
+    const ev = result.ipEvidence?.[ip];
+    const tag = ev?.org ? ` title="${escHtml(ev.org)}${ev.ptr ? ' · ' + escHtml(ev.ptr) : ''}"` : '';
+    const verified = ev?.matchedProviders?.length ? ' ip-verified' : '';
+    return `<span class="ip-chip${verified}" data-ip="${escHtml(ip)}"${tag}>${escHtml(ip)}</span>`;
+  }).join('');
+
+  // 1-2 IPs: show inline, no point wrapping something this small in a group.
+  // 3+ IPs (very common with anycast CDNs): its own styled, collapsible
+  // group with a count badge — previously this rendered as a long unstyled
+  // wrapped line of chips directly under the summary text.
+  const ipsInlineHtml = ipList.length > 0 && ipList.length <= 2
+    ? `<div class="scan-ips">${ipChipsHtml}</div>` : '';
+  const ipsGroupHtml = ipList.length > 2
+    ? groupSection('resolved-ips', '🌐 Resolved IPs', ipList.length,
+        `<div class="ip-chip-grid">${ipChipsHtml}</div>
+         <div class="breakdown-note" style="margin-top:8px">Tap an IP for PTR/RDAP cross-verification. ${ipList.length} IPs usually means anycast (multiple edge locations), not a problem to fix.</div>`,
+        true)
+    : '';
 
   const summaryText = detected.length === 0
     ? 'No providers detected'
     : `${detected.length} provider${detected.length > 1 ? 's' : ''} detected: <strong>${detected.map(id => PROVIDER_UI[id]?.name || id).join(', ')}</strong>`;
-  const metaLine = `<div class="scan-meta"><span>${summaryText}</span>${ipsHtml}</div>`;
+  const metaLine = `<div class="scan-meta"><span>${summaryText}</span>${ipsInlineHtml}</div>`;
 
   // ── STATUS LINES — consolidated into ONE compact block instead of
   // 5-6 separate stacked banners. Each line is short; only lines that
@@ -913,9 +963,16 @@ function renderOverview(result, cached, diff) {
   } else if (diff?.priorTs) {
     statusLines.push({ icon: '✓', text: `Same as last scan (${new Date(diff.priorTs).toLocaleDateString()})`, tone: 'unchanged' });
   }
-  if (detected.length > 1) statusLines.push({ icon: '⚠', text: 'Multi-CDN/WAF deployment', tone: 'changed' });
-  if (result.migrationWarning) statusLines.push({ icon: '⚡', text: result.migrationWarning.note, tone: 'changed' });
-  if (ipList.length > 1) statusLines.push({ icon: '🌍', text: `${ipList.length} IPs resolved (anycast) — tap an IP below for details`, tone: 'unchanged' });
+  if (result.migrationWarning) {
+    // Specific warning (2+ actual CDNs, not just CDN+WAF) — this already
+    // says what matters, so it replaces the generic "Multi-CDN/WAF" line
+    // instead of stacking both (they used to say almost the same thing twice).
+    statusLines.push({ icon: '⚠', text: result.migrationWarning.note, tone: 'changed' });
+  } else if (detected.length > 1) {
+    // CDN + WAF together (e.g. Cloudflare + Imperva) is a normal, common
+    // setup — neutral tone, no warning icon, since nothing here is concerning.
+    statusLines.push({ icon: 'ℹ', text: `${detected.length} providers working together (CDN + WAF is a common combination)`, tone: 'unchanged' });
+  }
 
   // Layer order folds into status lines too, as one line instead of its own block
   const lc = result.layerChain;
@@ -923,9 +980,11 @@ function renderOverview(result, cached, diff) {
     const nameOf = id => PROVIDER_UI[id]?.name || id;
     const hops = lc.chain.map(nameOf).join(' → ');
     statusLines.push({ icon: '📶', text: `Layer order: ${hops}`, tone: 'unchanged' });
-  } else if ((lc?.basis === 'no-via-header' || lc?.basis === 'via-incomplete') && detected.length > 1) {
-    statusLines.push({ icon: '📶', text: 'Layer order unknown (Via header absent/incomplete)', tone: 'unchanged' });
   }
+  // Note: "layer order unknown" is intentionally NOT shown as a status line —
+  // absence of a Via header is the common case, not something worth a line
+  // of its own every time. It's still visible in the Tree view for anyone
+  // who specifically wants to check layer order.
 
   const statusBlock = statusLines.length
     ? `<div class="status-block">${statusLines.map(l => `<div class="status-line status-${l.tone}"><span class="status-icon">${l.icon}</span>${escHtml(l.text)}</div>`).join('')}</div>`
@@ -941,10 +1000,12 @@ function renderOverview(result, cached, diff) {
   const fullCard = (id, ui, pv, isCustom) => {
     const score = pv?.verdict?.score ?? 0;
     const label = pv?.verdict?.label ?? 'Unlikely';
+    const weakSignal = !isCustom && (pv?.breakdown?.length === 1);
+    const weakBadge = weakSignal ? `<span class="weak-signal-badge" title="Only 1 signal supports this detection — higher chance of a false positive">⚠</span>` : '';
     return `
       <div class="provider-card detected" data-provider="${isCustom ? '' : id}" data-custom="${isCustom ? id : ''}" style="--pc:${ui.color}">
         <div class="pc-head"><div class="pc-dot"></div>
-          <span class="pc-name">${escHtml(ui.name)}</span>
+          <span class="pc-name">${escHtml(ui.name)}</span>${weakBadge}
           <span class="pc-score">${score}%</span></div>
         <div class="pc-bar-wrap">${score > 0 ? `<div class="pc-bar" style="width:${score}%"></div>` : ''}</div>
         <div class="pc-label">${escHtml(label)}${isCustom ? ' <em style="font-size:9px">(custom)</em>' : ''}</div>
@@ -953,10 +1014,12 @@ function renderOverview(result, cached, diff) {
   const compactRow = (id, ui, pv, isCustom) => {
     const score = pv?.verdict?.score ?? 0;
     const label = pv?.verdict?.label ?? 'Unlikely';
+    const weakSignal = !isCustom && (pv?.breakdown?.length === 1);
+    const weakBadge = weakSignal ? `<span class="weak-signal-badge" title="Only 1 signal supports this detection — higher chance of a false positive">⚠</span>` : '';
     return `
       <div class="provider-row-compact" data-provider="${isCustom ? '' : id}" data-custom="${isCustom ? id : ''}" style="--pc:${ui.color}">
         <div class="pc-dot"></div>
-        <span class="pc-name">${escHtml(ui.name)}</span>
+        <span class="pc-name">${escHtml(ui.name)}</span>${weakBadge}
         <span class="pc-label-inline">${escHtml(label)}${isCustom ? ' (custom)' : ''}</span>
         <span class="pc-score">${score}%</span>
       </div>`;
@@ -998,6 +1061,7 @@ function renderOverview(result, cached, diff) {
   }
   if (result.anycast?.dnssecValidated) netSignals.push(`<span class="info-pill" style="color:var(--green)">🔒 DNSSEC validated</span>`);
   if (result.anycast?.fastestResolver) netSignals.push(`<span class="info-pill">⚡ Fastest resolver: ${escHtml(result.anycast.fastestResolver)}</span>`);
+  if (result.unknownHeaders?.length) netSignals.push(`<span class="info-pill" style="color:var(--amber)">📋 ${result.unknownHeaders.length} unrecognized header${result.unknownHeaders.length > 1 ? 's' : ''} — see detected provider's detail view to report</span>`);
 
   const netBanners = [];
   if (result.anycast?.diverges) {
@@ -1046,6 +1110,7 @@ function renderOverview(result, cached, diff) {
     ${metaLine}
     ${statusBlock}
     ${detectedGroup}
+    ${ipsGroupHtml}
 
     ${groupSection('net-signals', '📡 Network & infrastructure signals', netGroupCount, netGroupBody, netGroupCount === 0)}
     ${groupSection('all-providers', `📋 All ${order.length} providers (incl. undetected)`, undetected.length, `<div class="providers-grid">${allCards}</div>`, true)}
@@ -1298,12 +1363,31 @@ function renderDetail(result, pid) {
       ${sectionHdr('Tab correlation')}
       <div id="tabCorrelationPanel"><div class="breakdown-note">Loading cross-tab data…</div></div>
       ${sectionHdr('Help improve this signature (opt-in)')}
-      <div class="breakdown-note">Noticed a header/cookie this provider isn't tracking yet? Describe it below — only sent if you've enabled crowd reporting in Settings with your own endpoint configured.</div>
-      <input type="text" id="crowdNoteInput" class="settings-input" placeholder="e.g. new header X-Foo-Edge seen on Cloudflare">
+      ${(result.unknownHeaders?.length)
+        ? `<div class="breakdown-note">This scan saw ${result.unknownHeaders.length} header${result.unknownHeaders.length > 1 ? 's' : ''} no provider recognizes yet — click to report it (only sent if crowd reporting is enabled in Settings):</div>
+           <div style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0">
+           ${result.unknownHeaders.map(h => `<button class="link-btn unknown-header-btn" data-header="${escHtml(h)}">📋 ${escHtml(h)}</button>`).join('')}
+           </div>`
+        : '<div class="breakdown-note">No unrecognized headers detected on this scan.</div>'}
+      <div class="breakdown-note" style="margin-top:8px">Or describe something else this provider isn't tracking yet:</div>
+      <input type="text" id="crowdNoteInput" class="settings-input" placeholder="e.g. new cookie xyz_session seen on Cloudflare">
       <button class="link-btn" id="crowdSubmitBtn">Send report</button>
+      <div id="crowdSubmitResult"></div>
     </div>`;
 
   document.getElementById('cveBtn').addEventListener('click', () => renderCveLookup(pid, ui.name));
+  // Wire one-click unknown-header report buttons
+  resultsEl.querySelectorAll('.unknown-header-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const header = btn.dataset.header;
+      chrome.runtime.sendMessage({ action: 'submitCrowdReport', providerId: pid, notes: `Unrecognized header: ${header}` }, res => {
+        const resultEl = document.getElementById('crowdSubmitResult');
+        if (resultEl) resultEl.innerHTML = `<div class="breakdown-note" style="margin-top:6px">✓ Reported "${escHtml(header)}" (if crowd reporting is enabled in Settings).</div>`;
+        btn.disabled = true;
+        btn.textContent = `✓ ${header}`;
+      });
+    });
+  });
   // D3: wire IP threat intel buttons
   resultsEl.querySelectorAll('.ip-threat-btn').forEach(btn => {
     btn.addEventListener('click', () => renderThreatIntel(btn.dataset.ip));
@@ -1327,7 +1411,8 @@ function renderDetail(result, pid) {
     if (!note) return;
     chrome.runtime.sendMessage({ action: 'submitCrowdReport', providerId: pid, notes: note }, () => {
       document.getElementById('crowdNoteInput').value = '';
-      document.getElementById('crowdSubmitBtn').textContent = 'Sent (if reporting is enabled) ✓';
+      const resultEl = document.getElementById('crowdSubmitResult');
+      if (resultEl) resultEl.innerHTML = '<div class="breakdown-note" style="margin-top:6px">✓ Sent (if crowd reporting is enabled in Settings).</div>';
     });
   });
 
@@ -1616,11 +1701,12 @@ function renderSettings(settings) {
       <div class="settings-section-title">Crowd-sourced signatures (opt-in)</div>
       <div class="settings-row">
         <span class="settings-label">Enable reporting
-          <span class="settings-hint">Sends only a provider ID + a short note you write — never your domain or IP. Requires your own deployed endpoint (see /worker/README.md).</span>
+          <span class="settings-hint">Every scan now automatically checks for response headers no provider recognizes yet, and surfaces them as one-click "report this?" buttons in each detected provider's detail view — no need to notice or type anything by hand. Sends only a provider ID + the header name or a short note — never your domain or IP. Requires your own deployed endpoint (see /worker/README.md).</span>
         </span>
         <label class="toggle-switch"><input type="checkbox" id="crowdToggle"><span class="slider"></span></label>
       </div>
       <input type="text" id="crowdEndpointInput" class="settings-input" placeholder="https://your-worker.example.workers.dev/report">
+      <div class="breakdown-note" style="margin-top:6px">View submitted reports and their frequency at your Worker's own URL (e.g. <code>https://your-worker.workers.dev/</code>) — the dashboard is built into the Worker code.</div>
 
       <div class="settings-section-title">Import a scan code</div>
       <div class="breakdown-note">Paste a share code (generated via the ⧉ Share button) to view a scan result from another session or machine.</div>
@@ -1628,16 +1714,9 @@ function renderSettings(settings) {
       <button class="btn-primary-sm" id="importCodeBtn">Load scan</button>
       <div id="importCodeResult"></div>
 
-      <div class="settings-section-title">Performance intelligence (Core Web Vitals)</div>
-      <div class="breakdown-note">Captures the CURRENT tab's real Core Web Vitals (LCP, CLS, TTFB) and attributes them to whichever provider the scan detected for that domain — builds a local trend over time, and shows how much load time third-party scripts (analytics, ads, fonts) account for versus the main domain.</div>
-      <button class="btn-primary-sm" id="captureVitalsBtn">📊 Capture vitals from current tab</button>
-      <div id="vitalsCaptureResult"></div>
-      <button class="link-btn" id="viewRumSummaryBtn" style="margin-top:8px">📈 View performance summary by provider</button>
-      <div id="rumSummaryPanel"></div>
-
       <div class="settings-section-title">About</div>
       <div class="breakdown-note">CDN/WAF Detector v9.1 — local scoring only, no telemetry by default.<br>
-      Keyboard shortcuts: <strong>Ctrl+Shift+S</strong> open popup · <strong>Ctrl+Shift+D</strong> side panel · <strong>Ctrl+Shift+V</strong> scan clipboard.<br>
+      Keyboard shortcuts: <strong>Ctrl+Shift+S</strong> open popup · <strong>Ctrl+Shift+D</strong> side panel · <strong>Ctrl+Shift+V</strong> scan clipboard · <strong>j/k</strong> navigate results · <strong>Enter</strong> open detail · <strong>Esc</strong> back.<br>
       Pinned domains and watchlist sync across your Chrome profiles automatically via <code>chrome.storage.sync</code> (same Google account, no server needed).</div>
 
       <div class="settings-section-title">Threat intel API keys (D3 — optional)</div>
@@ -1692,73 +1771,6 @@ function renderSettings(settings) {
       if (res?.error) { el.innerHTML = `<div class="import-result-err">Error: ${escHtml(res.error)}</div>`; return; }
       resultsEl._scan = res.result; resultsEl._cached = false; resultsEl._diff = null;
       renderOverview(res.result, false, null);
-    });
-  });
-
-  // ── #3/#4: Capture Core Web Vitals + waterfall from the active tab ──
-  document.getElementById('captureVitalsBtn').addEventListener('click', async () => {
-    const el = document.getElementById('vitalsCaptureResult');
-    el.innerHTML = '<div class="empty-state">Capturing…</div>';
-    try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (!tab?.id || !tab.url || !/^https?:/.test(tab.url)) {
-        el.innerHTML = '<div class="breakdown-note">Active tab must be a regular http(s) page.</div>';
-        return;
-      }
-      const domain = new URL(tab.url).hostname;
-      chrome.runtime.sendMessage({ action: 'getVitalsAndWaterfall', tabId: tab.id }, async res => {
-        const data = res?.data;
-        if (!data) { el.innerHTML = '<div class="breakdown-note">Could not read performance data from this tab (try reloading it first).</div>'; return; }
-
-        // Get cached scan result for this domain to know which provider to attribute to
-        chrome.runtime.sendMessage({ action: 'scan', domain, forceRefresh: false }, async scanRes => {
-          const providerIds = Object.entries(scanRes?.providers || {})
-            .filter(([, v]) => v.verdict?.detected).map(([id]) => id);
-
-          if (providerIds.length && data.vitals) {
-            chrome.runtime.sendMessage({ action: 'recordRumSample', providerIds, vitals: data.vitals });
-          }
-          chrome.runtime.sendMessage({
-            action: 'classifyThirdParty', entries: data.resourceEntries || [], mainDomain: data.mainDomain
-          }, waterfallRes => {
-            const w = waterfallRes?.result;
-            const vitalsHtml = `
-              <div class="tls-panel">
-                <strong>Vitals — ${escHtml(domain)}</strong><br>
-                LCP: ${data.vitals.lcp != null ? Math.round(data.vitals.lcp) + 'ms' : '—'} ·
-                CLS: ${data.vitals.cls ?? '—'} ·
-                TTFB: ${data.vitals.ttfb != null ? Math.round(data.vitals.ttfb) + 'ms' : '—'}
-                ${providerIds.length ? `<br><span class="breakdown-note">Attributed to: ${providerIds.map(id => PROVIDER_UI[id]?.name || id).join(', ')}</span>` : '<br><span class="breakdown-note">No detected provider to attribute this sample to (scan this domain first).</span>'}
-              </div>`;
-            const waterfallHtml = w ? `
-              <div class="tls-panel" style="margin-top:8px">
-                <strong>Third-party breakdown</strong><br>
-                Main domain: ${w.mainDomainTimeMs}ms · Third-party: ${w.thirdPartyTimeMs}ms (${w.thirdPartyPct}%)
-                <div style="margin-top:6px">${w.buckets.slice(0, 6).map(b => `<div class="breakdown-note">• ${escHtml(b.category)}: ${Math.round(b.totalMs)}ms (${Object.keys(b.items).length} resource${Object.keys(b.items).length !== 1 ? 's' : ''})</div>`).join('')}</div>
-              </div>` : '';
-            el.innerHTML = vitalsHtml + waterfallHtml;
-          });
-        });
-      });
-    } catch (e) {
-      el.innerHTML = `<div class="breakdown-note">Error: ${escHtml(e.message)}</div>`;
-    }
-  });
-
-  document.getElementById('viewRumSummaryBtn').addEventListener('click', () => {
-    const panel = document.getElementById('rumSummaryPanel');
-    panel.innerHTML = '<div class="empty-state">Loading…</div>';
-    chrome.runtime.sendMessage({ action: 'getRumSummary' }, res => {
-      const summary = res?.summary || {};
-      const entries = Object.entries(summary);
-      if (!entries.length) { panel.innerHTML = '<div class="breakdown-note">No samples yet — capture vitals a few times across different sites to build this up.</div>'; return; }
-      const rows = entries.map(([pid, s]) => `
-        <div class="tls-panel">
-          <strong>${escHtml(PROVIDER_UI[pid]?.name || pid)}</strong> (${s.sampleCount} sample${s.sampleCount !== 1 ? 's' : ''})<br>
-          Avg LCP: ${s.avgLCP != null ? s.avgLCP + 'ms' : '—'} · Median LCP: ${s.medianLCP != null ? s.medianLCP + 'ms' : '—'}<br>
-          Avg TTFB: ${s.avgTTFB != null ? s.avgTTFB + 'ms' : '—'} · Avg CLS: ${s.avgCLS ?? '—'}
-        </div>`).join('');
-      panel.innerHTML = `<div class="breakdown-note" style="margin-bottom:6px">Based on your own browsing — not a synthetic benchmark.</div>${rows}`;
     });
   });
 
@@ -1876,6 +1888,15 @@ function renderCustomProviders(providers) {
     <textarea id="cpJsonArea" class="import-json-area" placeholder='{"id":"custom_mycdn","name":"MyCDN","cnamePatterns":[{"pattern":"\\.mycdn\\.net$","points":80}]}'></textarea>
     <button class="btn-primary-sm" id="cpImportBtn">Import</button>
     <div id="cpResult"></div>`;
+
+  // #14: pick up a draft rule handed off from the crowd-report suggester
+  chrome.storage.local.get('pending_custom_rule_draft', res => {
+    if (res?.pending_custom_rule_draft) {
+      chrome.storage.local.remove('pending_custom_rule_draft');
+      const area = document.getElementById('cpJsonArea');
+      if (area) { area.value = res.pending_custom_rule_draft; area.scrollIntoView({ behavior: 'smooth' }); }
+    }
+  });
 
   document.getElementById('backBtn').addEventListener('click', () => {
     chrome.runtime.sendMessage({ action: 'getSettings' }, s => renderSettings(s || {}));
@@ -2040,9 +2061,33 @@ function renderTimeline(domain) {
         <button class="back-btn" id="backBtn">← Back</button>
         <span class="detail-name">📅 Timeline — ${escHtml(domain)}</span>
       </div>
+      <div style="padding:0 14px 8px"><button class="link-btn" id="exportDiffOnlyBtn">⇩ Export changes only (skip unchanged snapshots)</button></div>
       <div class="checks-list history-list">${rows}</div>`;
     document.getElementById('backBtn').addEventListener('click', () => {
       if (resultsEl._scan) renderOverview(resultsEl._scan, resultsEl._cached, resultsEl._diff);
+    });
+    document.getElementById('exportDiffOnlyBtn').addEventListener('click', () => {
+      // #10: filter to only snapshots that changed vs the one immediately
+      // before them — most domains scanned repeatedly show "no change" the
+      // majority of the time, so this trims a Timeline export down to just
+      // the moments that matter.
+      const changedOnly = [];
+      for (let i = 0; i < snaps.length; i++) {
+        const cur = snaps[i], prev = snaps[i + 1];
+        if (!prev) { changedOnly.push(snaps[i]); continue; } // first-ever scan always included
+        const prevIds = new Set(Object.entries(prev.result?.providers || {}).filter(([, v]) => v.verdict?.detected).map(([id]) => id));
+        const curIds  = new Set(Object.entries(cur.result?.providers || {}).filter(([, v]) => v.verdict?.detected).map(([id]) => id));
+        const changed = curIds.size !== prevIds.size || [...curIds].some(id => !prevIds.has(id));
+        if (changed) changedOnly.push(cur);
+      }
+      const md = [`# ${domain} — changes only`, '', `${changedOnly.length} of ${snaps.length} snapshots involved a change.`, ''];
+      for (const s of changedOnly) {
+        const names = Object.entries(s.result?.providers || {}).filter(([, v]) => v.verdict?.detected).map(([id]) => PROVIDER_UI[id]?.name || id);
+        md.push(`## ${new Date(s.ts).toLocaleString()}`, `Detected: ${names.join(', ') || 'None'}`, '');
+      }
+      const blob = new Blob([md.join('\n')], { type: 'text/markdown' });
+      const url = URL.createObjectURL(blob);
+      chrome.downloads.download({ url, filename: `cdnwaf-${domain}-changes-${Date.now()}.md` }, () => setTimeout(() => URL.revokeObjectURL(url), 10000));
     });
   });
 }
@@ -2102,25 +2147,32 @@ function renderTree(result, domain) {
     {
       id: 'waf', label: 'WAF / Bot Protection', icon: '🛡', color: '#f0555a',
       ids: ['imperva','sucuri','datadome','perimeterx','f5xc'],
-      tip: 'Filters malicious traffic before it reaches the CDN or origin'
+      tip: 'Filters malicious traffic before it reaches the CDN or origin',
+      // Providers in this list are true "full CDN" services — having 2+ of
+      // THESE together in the same layer is unusual (most sites use one
+      // primary CDN), unlike WAF+CDN combos which are completely normal.
+      competingFullServices: false,
     },
     {
       id: 'cdn', label: 'CDN / Global Delivery', icon: '🌐', color: '#1ed4ff',
       ids: ['cloudflare','google','akamai','fastly','cloudfront','azure',
             'bunnycdn','stackpath','keycdn','gcore','tencenteo','alicdn','arvancloud','vncdn'],
-      tip: 'Caches and delivers content from edge PoPs near end-users'
+      tip: 'Caches and delivers content from edge PoPs near end-users',
+      competingFullServices: true,
     },
     {
       id: 'hosting', label: 'Edge Hosting / Serverless', icon: '⚡', color: '#8b5cf6',
       ids: ['vercel','netlify','flyio','render','railway'],
-      tip: 'Application hosting with built-in edge delivery; often the origin itself'
+      tip: 'Application hosting with built-in edge delivery; often the origin itself',
+      competingFullServices: true,
     },
   ];
 
-  const detectedMap = {};
+  const detectedMap = {};    // id -> score
+  const breakdownMap = {};   // id -> breakdown array (for weak-signal check)
   for (const id of Object.keys(PROVIDER_UI)) {
     const pv = result.providers?.[id];
-    if (pv?.verdict?.detected) detectedMap[id] = pv.verdict.score;
+    if (pv?.verdict?.detected) { detectedMap[id] = pv.verdict.score; breakdownMap[id] = pv.breakdown || []; }
   }
 
   const chainOrder = result.layerChain?.chain || [];
@@ -2132,15 +2184,22 @@ function renderTree(result, domain) {
     return [...inChain, ...notChain];
   };
 
+  // Track which provider IDs got "absorbed" into a chip (so sidebar items
+  // that match one of them can merge instead of listing separately).
+  const absorbedProviderIds = new Set();
+
   const chip = (id, layerColor) => {
     const ui      = PROVIDER_UI[id];
     const score   = detectedMap[id] ?? 0;
     const color   = ui?.color || layerColor;
     const inChain = chainOrder.includes(id);
+    const weak    = (breakdownMap[id]?.length === 1);
+    const weakBadge = weak ? `<span class="weak-signal-badge" title="Only 1 signal supports this — higher chance of false positive">⚠</span>` : '';
+    absorbedProviderIds.add(id);
     return `<span class="tree-chip${inChain ? ' chain-confirmed' : ''}"
       style="border-color:${escHtml(color)};color:${escHtml(color)}"
-      title="${escHtml(ui?.name || id)} — ${score}% confidence${inChain ? ' (confirmed by Via header)' : ''}">
-      ${escHtml(ui?.name || id)} <span class="tree-chip-score">${score}%</span>
+      title="${escHtml(ui?.name || id)} — ${score}% confidence${inChain ? ' (confirmed by Via header)' : ''}${weak ? ' — WEAK: only 1 supporting signal' : ''}">
+      ${escHtml(ui?.name || id)}${weakBadge} <span class="tree-chip-score">${score}%</span>
     </span>`;
   };
 
@@ -2148,16 +2207,31 @@ function renderTree(result, domain) {
   const clientNode = `<div class="tree-node tree-client">🌐 Visitor</div>`;
 
   let layersHtml = '', detectedCount = 0;
+  const layerConflicts = []; // collects human-readable conflict notes
   for (const layer of TAXONOMY) {
     const presentIds = sortByChain(layer.ids.filter(id => detectedMap[id] !== undefined));
     if (!presentIds.length) continue;
     detectedCount += presentIds.length;
+
+    // ── Conflict detection: 2+ competing full-service providers in one
+    // layer is unusual and often means at least one is a false positive
+    // (shared IP ranges, stale CNAME, or a genuine mid-migration state).
+    // Flagged directly on the layer instead of silently listing both as
+    // if they were equally certain.
+    let conflictNote = '';
+    if (layer.competingFullServices && presentIds.length > 1) {
+      const names = presentIds.map(id => PROVIDER_UI[id]?.name || id);
+      layerConflicts.push({ layer: layer.label, providers: names });
+      conflictNote = `<div class="tree-layer-conflict">⚠ ${presentIds.length} providers competing for the same role — unusual for one site. Could be a mid-migration state, a shared-IP false positive, or a genuine multi-CDN setup. Check the weaker score's signal count before trusting it.</div>`;
+    }
+
     layersHtml += `
       ${arrowDown}
       <div class="tree-layer" style="--layer-color:${layer.color}">
         <div class="tree-layer-label">${layer.icon} ${escHtml(layer.label)}</div>
         <div class="tree-chips">${presentIds.map(id => chip(id, layer.color)).join('')}</div>
         <div class="tree-layer-tip">${escHtml(layer.tip)}</div>
+        ${conflictNote}
       </div>`;
   }
 
@@ -2169,8 +2243,30 @@ function renderTree(result, domain) {
     layersHtml += `${arrowDown}<div class="tree-layer" style="--layer-color:#94a3b8"><div class="tree-layer-label">📦 Custom Providers</div><div class="tree-chips">${chips}</div></div>`;
   }
 
+  // ── Sidebar — same-provider linking ─────────────────────────────
+  // If the DNS provider (or another sidebar fact) names a company that's
+  // ALSO one of the detected chips above, that's the same vendor doing
+  // double duty (e.g. Cloudflare as both WAF and DNS). Instead of listing
+  // "DNS: Cloudflare" as an unrelated fact next to a separate "Cloudflare"
+  // chip, tag it onto the existing chip's tooltip and only show the
+  // remaining, genuinely-separate context items in the sidebar.
+  const nameToId = {};
+  for (const id of Object.keys(PROVIDER_UI)) nameToId[PROVIDER_UI[id].name.toLowerCase()] = id;
+  const matchesDetectedProvider = name => {
+    const guess = Object.keys(nameToId).find(n => name?.toLowerCase().includes(n.split(' ')[0]));
+    return guess ? nameToId[guess] : null;
+  };
+
+  const linkedNotes = []; // "Cloudflare also handles DNS" style notes shown under the matching chip's layer
   const sideItems = [];
-  if (result.dnsProvider) sideItems.push({ icon: '🔑', label: 'DNS', value: result.dnsProvider, color: '#2ecc71' });
+
+  const dnsMatch = result.dnsProvider ? matchesDetectedProvider(result.dnsProvider) : null;
+  if (result.dnsProvider && dnsMatch && absorbedProviderIds.has(dnsMatch)) {
+    linkedNotes.push(`${PROVIDER_UI[dnsMatch].name} also manages DNS for this domain`);
+  } else if (result.dnsProvider) {
+    sideItems.push({ icon: '🔑', label: 'DNS', value: result.dnsProvider, color: '#2ecc71' });
+  }
+
   if (result.spfDmarc?.spfProvider) sideItems.push({ icon: '✉', label: 'Email', value: result.spfDmarc.spfProvider, color: '#f5a623' });
   if (result.httpsRecord?.ech) sideItems.push({ icon: '🔒', label: 'ECH', value: 'Enabled', color: '#1ed4ff' });
   if (result.anycast?.diverges) sideItems.push({ icon: '🌍', label: 'Anycast', value: `${result.anycast.uniqueIps?.length || '?'} edges seen`, color: '#1ed4ff' });
@@ -2179,9 +2275,12 @@ function renderTree(result, domain) {
   if (result.anycast?.ecsLeakSuspected) sideItems.push({ icon: '📡', label: 'ECS leak', value: 'Suspected', color: '#f0555a' });
   if (result.anycast?.fastestResolver) sideItems.push({ icon: '⚡', label: 'Fastest resolver', value: result.anycast.fastestResolver, color: '#94a3b8' });
 
+  const linkedNotesHtml = linkedNotes.length
+    ? `<div class="tree-linked-notes">${linkedNotes.map(n => `<div class="tree-linked-note">🔗 ${escHtml(n)}</div>`).join('')}</div>` : '';
+
   const sideBar = sideItems.length ? `
     <div class="tree-sidebar">
-      <div class="tree-sidebar-title">Infrastructure context</div>
+      <div class="tree-sidebar-title">Additional context</div>
       ${sideItems.map(s => `<div class="tree-side-item" style="border-left-color:${s.color}">
         <span class="tree-side-icon">${s.icon}</span>
         <span class="tree-side-label">${escHtml(s.label)}</span>
@@ -2197,25 +2296,27 @@ function renderTree(result, domain) {
   const treeContent = !detectedCount
     ? '<div class="empty-state" style="padding:28px 0">No providers detected — nothing to visualize.</div>'
     : `<div class="tree-wrapper">
-        <div class="tree-view">${clientNode}${layersHtml}${originNode}</div>
+        <div class="tree-view">${clientNode}${layersHtml}${linkedNotesHtml}${originNode}</div>
         ${sideBar}
       </div>${chainNote}`;
 
-  const probeBtn = `<div style="text-align:center;margin-top:14px">
-    <button class="link-btn" id="distProbeBtn">🌍 Probe from 12 global locations (check-host.net)</button>
-    <div id="distProbePanel"></div>
-  </div>`;
-
-  const round5Row = `
-    <div class="tree-action-row">
-      <button class="link-btn" id="wellKnownBtn">📄 robots.txt / security.txt</button>
-      <button class="link-btn" id="blastRadiusBtn">💥 Blast radius</button>
-      <button class="link-btn" id="waybackBtn">🕰 Wayback history</button>
-      <button class="link-btn" id="fingerprintBtn">🔖 Fingerprint string</button>
-      <button class="link-btn" id="statusPageBtn">📡 Check status pages</button>
-      <button class="link-btn" id="dnsBlockBtn">🚧 Check DNS blocking</button>
+  // ── All action buttons — grouped into one collapsible Tools section
+  // instead of two dense rows dumped directly under the tree (which had
+  // the exact same "chi chít" problem the Overview redesign fixed).
+  const toolsBody = `
+    <div class="tools-grid">
+      <button id="distProbeBtn">🌍 Probe 12 locations</button>
+      <button id="waybackBtn">🕰 Wayback history</button>
+      <button id="fingerprintBtn">🔖 Fingerprint string</button>
+      <button id="statusPageBtn">📡 Check status pages</button>
+      <button id="dnsBlockBtn">🚧 Check DNS blocking</button>
+      <button id="explainBtn">💬 Explain in plain words</button>
+      <button id="explainBossBtn">📧 Explain for a report</button>
+      <button id="quickCompareBtn">⇄ Quick compare</button>
     </div>
-    <div id="round5Panel"></div>`;
+    <div id="distProbePanel"></div>
+    <div id="round5Panel"></div>
+    <div id="round7Panel"></div>`;
 
   resultsEl.innerHTML = `
     <div class="detail-header">
@@ -2224,22 +2325,128 @@ function renderTree(result, domain) {
     </div>
     <div class="checks-list" style="padding:12px 14px">
       ${treeContent}
-      ${probeBtn}
-      ${round5Row}
+      ${groupSection('tree-tools', '🛠 Analysis tools', 8, toolsBody, true)}
     </div>`;
 
   document.getElementById('backBtn').addEventListener('click', () => {
     if (resultsEl._scan) renderOverview(resultsEl._scan, resultsEl._cached, resultsEl._diff);
   });
+  resultsEl.querySelectorAll('.group-header').forEach(h => {
+    h.addEventListener('click', () => {
+      const body = h.nextElementSibling;
+      const collapsed = body.classList.toggle('collapsed');
+      h.querySelector('.group-chevron').textContent = collapsed ? '▸' : '▾';
+    });
+  });
   document.getElementById('distProbeBtn').addEventListener('click', () =>
     renderDistributedProbe(domain, document.getElementById('distProbePanel'))
   );
-  document.getElementById('wellKnownBtn').addEventListener('click', () => renderWellKnown(domain));
-  document.getElementById('blastRadiusBtn').addEventListener('click', () => renderBlastRadius(result));
   document.getElementById('waybackBtn').addEventListener('click', () => renderWayback(domain));
   document.getElementById('fingerprintBtn').addEventListener('click', () => renderFingerprint(result));
   document.getElementById('statusPageBtn').addEventListener('click', () => renderStatusCheck(result));
   document.getElementById('dnsBlockBtn').addEventListener('click', () => renderDnsBlockCheck(domain));
+  document.getElementById('explainBtn').addEventListener('click', () => renderExplainPlain(result, domain));
+  document.getElementById('explainBossBtn').addEventListener('click', () => renderExplainForReport(result, domain));
+  document.getElementById('quickCompareBtn').addEventListener('click', () => renderQuickCompare(domain));
+}
+
+// ── Explain in plain words — turns breakdown/signals into a sentence ──
+function renderExplainPlain(result, domain) {
+  const panel = document.getElementById('round7Panel');
+  if (!panel) return;
+  const detected = Object.entries(result.providers || {}).filter(([, v]) => v.verdict?.detected);
+  if (!detected.length) {
+    panel.innerHTML = `<div class="tls-panel">No providers were detected for ${escHtml(domain)}, so there's nothing to explain yet.</div>`;
+    return;
+  }
+  const sentences = detected.map(([id, pv]) => {
+    const name = PROVIDER_UI[id]?.name || id;
+    const breakdown = pv.breakdown || [];
+    if (!breakdown.length) return `<strong>${escHtml(name)}</strong> was detected (${pv.verdict.score}% confidence), but the exact signals that triggered it weren't itemized.`;
+    const signalNames = breakdown.slice(0, 4).map(b => {
+      // Reuse the same label lookup pattern as the detail view
+      for (const ui of [PROVIDER_UI[id]]) {
+        for (const g of (ui?.groups || [])) {
+          const found = g.signals.find(s => s.key === b.signal);
+          if (found) return found.label;
+        }
+      }
+      return b.signal;
+    });
+    const n = breakdown.length;
+    return `<strong>${escHtml(name)}</strong> was detected via ${signalNames.map(escHtml).join(', ')}${n > signalNames.length ? ` and ${n - signalNames.length} more signal${n - signalNames.length > 1 ? 's' : ''}` : ''} (${n} signal${n > 1 ? 's' : ''} total, ${pv.verdict.score}% confidence).`;
+  });
+  panel.innerHTML = `<div class="tls-panel">${sentences.join('<br><br>')}</div>`;
+}
+
+// ── #4: Explain for a report — non-technical summary to paste elsewhere ──
+function renderExplainForReport(result, domain) {
+  const panel = document.getElementById('round7Panel');
+  if (!panel) return;
+  const detected = Object.entries(result.providers || {}).filter(([, v]) => v.verdict?.detected).map(([id]) => PROVIDER_UI[id]?.name || id);
+  const wafNames = ['Imperva', 'Sucuri', 'DataDome', 'PerimeterX', 'F5 Distributed Cloud'];
+  const cdnNames = detected.filter(n => !wafNames.includes(n));
+  const wafDetected = detected.filter(n => wafNames.includes(n));
+
+  let text;
+  if (!detected.length) {
+    text = `${domain} does not appear to use a recognizable third-party CDN or WAF service — it may be served directly from its own infrastructure, or use a provider not yet covered by this tool.`;
+  } else {
+    const parts = [];
+    if (cdnNames.length) parts.push(`${cdnNames.join(' and ')} for content delivery`);
+    if (wafDetected.length) parts.push(`${wafDetected.join(' and ')} for security/bot protection`);
+    text = `${domain} uses ${parts.join(', with ')}. `;
+    if (detected.length > 1) text += `Multiple providers working together is a normal setup for larger sites. `;
+    if (result.anycast?.dnssecValidated) text += `DNS is protected with DNSSEC. `;
+    text += `No further action is needed unless you're specifically investigating a migration or an incident.`;
+  }
+  panel.innerHTML = `
+    <div class="tls-panel">${escHtml(text)}</div>
+    <button class="link-btn" id="copyExplainBtn" style="margin-top:8px">⧉ Copy this text</button>`;
+  document.getElementById('copyExplainBtn').addEventListener('click', () => {
+    navigator.clipboard.writeText(text).catch(() => {});
+    const btn = document.getElementById('copyExplainBtn');
+    if (btn) { btn.textContent = '✓ Copied!'; setTimeout(() => { if (btn) btn.textContent = '⧉ Copy this text'; }, 2000); }
+  });
+}
+
+// ── Quick compare — inline, without leaving the popup ──────────
+function renderQuickCompare(domainA) {
+  const panel = document.getElementById('round7Panel');
+  if (!panel) return;
+  panel.innerHTML = `
+    <div class="tls-panel">
+      <strong>Quick compare: ${escHtml(domainA)} vs…</strong>
+      <input type="text" id="quickCompareInput" class="settings-input" placeholder="other-domain.com" style="margin-top:8px">
+      <button class="link-btn" id="quickCompareRunBtn" style="margin-top:8px">Scan & compare</button>
+      <div id="quickCompareResult"></div>
+    </div>`;
+  document.getElementById('quickCompareRunBtn').addEventListener('click', () => {
+    const domainB = document.getElementById('quickCompareInput').value.trim().toLowerCase();
+    if (!domainB) return;
+    const resultEl = document.getElementById('quickCompareResult');
+    resultEl.innerHTML = '<div class="empty-state">Scanning…</div>';
+    const port = chrome.runtime.connect({ name: 'scan' });
+    port.onMessage.addListener(msg => {
+      if (msg.type === 'result') {
+        port.disconnect();
+        const detA = new Set(Object.entries(resultsEl._scan?.providers || {}).filter(([, v]) => v.verdict?.detected).map(([id]) => id));
+        const detB = new Set(Object.entries(msg.data.providers || {}).filter(([, v]) => v.verdict?.detected).map(([id]) => id));
+        const shared = [...detA].filter(id => detB.has(id));
+        const onlyA  = [...detA].filter(id => !detB.has(id));
+        const onlyB  = [...detB].filter(id => !detA.has(id));
+        const nameOf = id => PROVIDER_UI[id]?.name || id;
+        resultEl.innerHTML = `
+          <div class="breakdown-note">Shared: ${shared.length ? shared.map(nameOf).join(', ') : '—'}</div>
+          <div class="breakdown-note">Only ${escHtml(domainA)}: ${onlyA.length ? onlyA.map(nameOf).join(', ') : '—'}</div>
+          <div class="breakdown-note">Only ${escHtml(domainB)}: ${onlyB.length ? onlyB.map(nameOf).join(', ') : '—'}</div>`;
+      } else if (msg.type === 'error') {
+        port.disconnect();
+        resultEl.innerHTML = `<div class="breakdown-note">Failed: ${escHtml(msg.message)}</div>`;
+      }
+    });
+    port.postMessage({ action: 'scan', domain: domainB, forceRefresh: false });
+  });
 }
 
 // ── #1: DNS-blocking/censorship diagnostic panel ────────────────
@@ -2270,50 +2477,7 @@ function renderDnsBlockCheck(domain) {
   });
 }
 
-// ── #7: robots.txt / security.txt OSINT panel ──────────────────
-function renderWellKnown(domain) {
-  const panel = document.getElementById('round5Panel');
-  if (!panel) return;
-  panel.innerHTML = '<div class="empty-state">Fetching robots.txt and security.txt…</div>';
-  chrome.runtime.sendMessage({ action: 'probeWellKnownFiles', domain }, res => {
-    if (!panel.isConnected) return;
-    const findingsHtml = (res.findings || []).map(f => `<div class="breakdown-note">• ${escHtml(f)}</div>`).join('');
-    const robotsHtml = res.robotsTxt
-      ? `<div class="tls-panel"><strong>robots.txt</strong> (${res.robotsTxt.length} bytes)<br>
-         <pre style="white-space:pre-wrap;font-size:9.5px;color:var(--text-dim);margin-top:6px;max-height:120px;overflow:auto">${escHtml(res.robotsTxt.snippet)}</pre></div>`
-      : '<div class="breakdown-note">No robots.txt found.</div>';
-    const secHtml = res.securityTxt
-      ? `<div class="tls-panel"><strong>${escHtml(res.securityTxt.path)}</strong> (${res.securityTxt.length} bytes)<br>
-         <pre style="white-space:pre-wrap;font-size:9.5px;color:var(--text-dim);margin-top:6px;max-height:120px;overflow:auto">${escHtml(res.securityTxt.snippet)}</pre></div>`
-      : '<div class="breakdown-note">No security.txt found (checked /.well-known/security.txt and /security.txt).</div>';
-    panel.innerHTML = `${findingsHtml}${robotsHtml}${secHtml}`;
-  });
-}
-
-// ── #8: Blast radius — hostnames sharing the same IP ────────────
-function renderBlastRadius(result) {
-  const panel = document.getElementById('round5Panel');
-  if (!panel) return;
-  const ips = result.resolvedIPs || [];
-  if (!ips.length) { panel.innerHTML = '<div class="breakdown-note">No resolved IPs to check.</div>'; return; }
-  panel.innerHTML = '<div class="empty-state">Checking shared-hostname data via Shodan InternetDB…</div>';
-  Promise.all(ips.map(ip => new Promise(resolve =>
-    chrome.runtime.sendMessage({ action: 'checkBlastRadius', ip }, r => resolve(r))
-  ))).then(results => {
-    if (!panel.isConnected) return;
-    const rows = results.map(r => `
-      <div class="tls-panel">
-        <strong>${escHtml(r.ip)}</strong><br>
-        ${r.hostnames.length
-          ? `<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">${r.hostnames.slice(0, 20).map(h => `<span class="info-pill">${escHtml(h)}</span>`).join('')}</div>`
-          : ''}
-        <div class="breakdown-note" style="margin-top:6px">${escHtml(r.note)}</div>
-      </div>`).join('');
-    panel.innerHTML = rows;
-  });
-}
-
-// ── #9: CDN status-page correlation ─────────────────────────────
+// ── CDN status-page correlation ─────────────────────────────
 function renderStatusCheck(result) {
   const panel = document.getElementById('round5Panel');
   if (!panel) return;

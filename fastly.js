@@ -13,6 +13,20 @@ self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'fastly', name: 'Fastly', color: '#ff282d', icon: '⚡',
 
+  knownHeaders: [
+    'fastly-debug-digest',
+    'fastly-debug-path',
+    'fastly-debug-ttl',
+    'fastly-restarts',
+    'surrogate-control',
+    'surrogate-key',
+    'x-fastly-imageopto-api',
+    'x-fastly-request-id',
+    'x-served-by',
+    'x-timer',
+    'x-varnish',
+  ],
+
   ipConfig: {
     ipSignal: 'fastlyIP', storageKey: 'ip_fastly',
     v4Url: 'https://api.fastly.com/public-ip-list',

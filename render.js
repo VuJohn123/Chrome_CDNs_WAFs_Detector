@@ -9,6 +9,10 @@
 self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'render', name: 'Render', color: '#46e3b7', icon: '🎨',
+
+  knownHeaders: [
+    'x-render-origin-server',
+  ],
   productType: 'App/static hosting (not a traditional CDN)',
 
   freshSignals: () => ({

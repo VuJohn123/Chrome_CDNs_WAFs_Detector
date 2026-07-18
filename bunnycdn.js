@@ -11,6 +11,22 @@ self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'bunnycdn', name: 'BunnyCDN', color: '#f5a623', icon: '🐰',
 
+  knownHeaders: [
+    'cdn-cache',
+    'cdn-cachedat',
+    'cdn-edgestorageid',
+    'cdn-noderegion',
+    'cdn-proxyver',
+    'cdn-pullzone',
+    'cdn-requestcountrycode',
+    'cdn-requestid',
+    'cdn-requestpullcode',
+    'cdn-requestpullsuccess',
+    'cdn-status',
+    'cdn-uid',
+    'x-bunny-shield',
+  ],
+
   ipConfig: {
     ipSignal: 'bunnyIP', storageKey: 'ip_bunny',
     v4Url: 'https://bunnycdn.com/api/system/edgeserverlist',

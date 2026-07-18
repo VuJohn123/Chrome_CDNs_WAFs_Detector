@@ -10,6 +10,15 @@
 self.CDN_PROVIDERS = self.CDN_PROVIDERS || [];
 self.CDN_PROVIDERS.push({
   id: 'keycdn', name: 'KeyCDN', color: '#2a99ff', icon: '🔑',
+
+  knownHeaders: [
+    'x-0-cache',
+    'x-0-cid',
+    'x-edge-ip',
+    'x-edge-location',
+    'x-pull-zone',
+    'x-unique-id',
+  ],
   ipConfig: null,
 
   freshSignals: () => ({
